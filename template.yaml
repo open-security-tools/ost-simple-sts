@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ost-simple-sts - exchanges GitHub Actions OIDC tokens for short-lived
+  GitHub App installation tokens.
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    Timeout: 10
+    MemorySize: 256
+
+Parameters:
+  PolicyJson:
+    Type: String
+    Description: JSON policy document for OIDC validation
+  AppIdParameterName:
+    Type: String
+    Default: /ost/app-id
+  AppPrivateKeySecretName:
+    Type: String
+    Description: Secrets Manager secret name containing the GitHub App PEM private key
+  JtiTableName:
+    Type: String
+    Default: ost-jti-replay
+
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+
+  JtiTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref JtiTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jti_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jti_hash
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  SimpleStsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      CodeUri: .
+      Handler: bootstrap
+      Environment:
+        Variables:
+          POLICY_JSON: !Ref PolicyJson
+          APP_ID_PARAMETER: !Ref AppIdParameterName
+          APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
+          JTI_TABLE_NAME: !Ref JtiTableName
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /health
+            Method: GET
+        Exchange:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /exchange
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JtiTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref AppIdParameterName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}*
+
+Outputs:
+  ApiUrl:
+    Description: Base API URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  ExchangeUrl:
+    Description: Full exchange endpoint URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/exchange
