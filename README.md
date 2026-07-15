@@ -102,6 +102,9 @@ The exchange lifecycle is roughly:
 1. Mint a GitHub App JWT and resolve the repository installation
 1. Mint and return a repository-scoped installation token
 
+The JWKS cache refreshes at most once every 30 seconds for an unknown key ID, allowing key rotation
+without letting unauthenticated requests amplify outbound traffic.
+
 Requests to the following GitHub routes are expected:
 
 - `GET /repos/{owner}/{repo}/installation`
