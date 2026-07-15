@@ -63,6 +63,12 @@ impl<'de> Deserialize<'de> for Token {
     }
 }
 
+impl Serialize for Token {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 pub fn create_app_jwt(
     app_id: impl AsRef<str>,
     private_key_pem: impl AsRef<str>,
@@ -188,6 +194,7 @@ mod tests {
         assert_eq!(format!("{token:?}"), "Token(<redacted>)");
         assert_eq!(format!("{token}"), "<redacted>");
         assert_eq!(token.as_str(), "ghs_secret");
+        assert_eq!(serde_json::to_string(&token).unwrap(), r#""ghs_secret""#);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use lambda_http::http::StatusCode;
 use lambda_http::{Body, Response};
 use serde::Serialize;
 
-use crate::error::AppError;
+use crate::{error::AppError, github::Token};
 
 #[derive(Debug)]
 pub(crate) enum AppResponse {
@@ -16,13 +16,13 @@ impl AppResponse {
     }
 
     pub(crate) fn exchange(
-        token: impl AsRef<str>,
+        token: Token,
         expires_at: impl Into<String>,
         repository: impl Into<String>,
         git_ref: impl Into<String>,
     ) -> Self {
         Self::Exchange(ExchangeResponse {
-            token: token.as_ref().to_string(),
+            token,
             expires_at: expires_at.into(),
             repository: repository.into(),
             git_ref: git_ref.into(),
@@ -45,7 +45,7 @@ pub(crate) struct HealthResponse {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct ExchangeResponse {
-    token: String,
+    token: Token,
     expires_at: String,
     repository: String,
     #[serde(rename = "ref")]
@@ -98,4 +98,41 @@ fn internal_server_error_response() -> Response<Body> {
     });
 
     build_json_response(StatusCode::INTERNAL_SERVER_ERROR, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use lambda_http::Body;
+    use serde_json::json;
+
+    use super::AppResponse;
+    use crate::github::Token;
+
+    #[test]
+    fn exchange_response_redacts_debug_and_serializes_token() {
+        let token: Token = serde_json::from_str(r#""ghs_secret""#).unwrap();
+        let response = AppResponse::exchange(
+            token,
+            "2026-03-28T00:00:00Z",
+            "octo/tools",
+            "refs/heads/main",
+        );
+
+        assert!(!format!("{response:?}").contains("ghs_secret"));
+
+        let response = response.into_response();
+        let Body::Binary(body) = response.body() else {
+            panic!("expected JSON response body");
+        };
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "token": "ghs_secret",
+                "expires_at": "2026-03-28T00:00:00Z",
+                "repository": "octo/tools",
+                "ref": "refs/heads/main"
+            })
+        );
+    }
 }
