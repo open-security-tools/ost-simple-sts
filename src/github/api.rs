@@ -10,8 +10,9 @@ use crate::error::AppError;
 
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com/";
 const GITHUB_API_VERSION: &str = "2022-11-28";
-const GITHUB_REQUEST_MAX_ATTEMPTS: usize = 3;
+const GITHUB_REQUEST_MAX_ATTEMPTS: usize = 2;
 const GITHUB_REQUEST_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const GITHUB_REQUEST_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Stores the configured base URL for GitHub API requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +45,13 @@ impl TryFrom<String> for GithubApiBase {
             "http" => url.host_str().is_some_and(is_loopback_host),
             _ => false,
         };
-        if !allowed_scheme {
+        if !allowed_scheme
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
             return Err(AppError::InvalidGithubApiUrl);
         }
         if !url.path().ends_with('/') {
@@ -149,6 +156,7 @@ fn retry_delay(status: StatusCode, headers: &HeaderMap, fallback: Duration) -> D
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
+            .map(|delay| delay.min(GITHUB_REQUEST_MAX_BACKOFF))
             .unwrap_or(fallback)
     } else {
         fallback
@@ -202,7 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn retry_delay_uses_retry_after() {
+    fn api_base_rejects_credentials_queries_and_fragments() {
+        for value in [
+            "https://token@ghe.example.com/api/v3",
+            "https://user:token@ghe.example.com/api/v3",
+            "https://ghe.example.com/api/v3?token=secret",
+            "https://ghe.example.com/api/v3#token=secret",
+        ] {
+            assert!(GithubApiBase::try_from(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_bounds_retry_after() {
         let mut headers = HeaderMap::new();
         headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
 
@@ -212,7 +232,7 @@ mod tests {
                 &headers,
                 Duration::from_millis(200)
             ),
-            Duration::from_secs(7)
+            Duration::from_secs(1)
         );
     }
 
