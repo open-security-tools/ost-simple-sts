@@ -51,8 +51,8 @@ The GitHub App needs the following repository permissions:
 - **Contents**: read and write
 - **Metadata**: read-only
 
-Install the App on the repository allowed by the policy. The broker requests an installation token
-for exactly that repository ID and only the `contents: write` permission.
+Install the App on each repository allowed by the policy. The broker requests an installation token
+for exactly the matched repository ID and only the `contents: write` permission.
 
 ## Policy
 
@@ -62,28 +62,36 @@ ignored `policy.json` and replace every example value for the calling repository
 ```json
 {
   "expected_audience": "https://example.execute-api.us-east-1.amazonaws.com",
-  "allowed_subject": "repo:example-org@123456/example-repo@789012:environment:release",
-  "allowed_repository": "example-org/example-repo",
-  "allowed_repository_id": 789012,
-  "allowed_ref": "refs/heads/main",
-  "allowed_workflow_path": ".github/workflows/release.yml",
-  "allowed_environment": "release"
+  "rules": [
+    {
+      "subject": "repo:example-org@123456/example-repo@789012:environment:release",
+      "repository": "example-org/example-repo",
+      "repository_id": 789012,
+      "ref": "refs/heads/main",
+      "workflow_path": ".github/workflows/release.yml",
+      "environment": "release"
+    }
+  ]
 }
 ```
 
-All fields except `allowed_environment` are required, and unknown fields are rejected. The policy
-binds both the mutable repository name and immutable repository ID; the ID can be obtained with
+`expected_audience` and a non-empty `rules` list are required. Within each rule, all fields except
+`environment` are required, and unknown fields are rejected. Each rule binds both the mutable
+repository name and immutable repository ID; the ID can be obtained with
 `gh api repos/OWNER/REPO --jq .id`.
 
-`allowed_subject` must exactly match the `sub` claim emitted by the calling job. Jobs using an
+Every claim must match the same rule. Repositories, refs, workflows, and environments from
+different rules are never combined.
+
+`subject` must exactly match the `sub` claim emitted by the calling job. Jobs using an
 environment have an environment subject. New repositories use GitHub's immutable subject format,
 shown above; repositories using the previous format would use
 `repo:example-org/example-repo:environment:release` instead. Keep the environment's deployment
 rules restricted to the intended ref.
 
-The caller's `workflow_ref` must match the configured workflow path and ref. If the job runs in a
-reusable workflow, its `job_workflow_ref` must match too; a trusted caller cannot delegate token
-minting to a different reusable workflow.
+The caller's `workflow_ref` must match the selected rule's repository, workflow path, and ref. If
+the job runs in a reusable workflow, its `job_workflow_ref` must match too; a trusted caller cannot
+delegate token minting to a different reusable workflow.
 
 ## Exchange
 
@@ -97,7 +105,7 @@ The exchange lifecycle is roughly:
 1. Receive an OIDC token in `Authorization: Bearer <oidc-jwt>`
 1. Validate the JWT signature against the cached GitHub Actions JWKS
 1. Validate issuer, audience, subject, expiry, not-before, and issued-at claims
-1. Require the configured repository name and ID, ref, workflow path, and environment
+1. Match one configured rule's repository name and ID, ref, workflow path, and environment
 1. Require a `workflow_dispatch` event
 1. Claim the OIDC `jti` with a conditional DynamoDB write to prevent replay
 1. Mint a GitHub App JWT and resolve the repository installation
@@ -135,7 +143,7 @@ Parameter Store, and read only the named App private key from Secrets Manager. T
 limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
 
 Create the local configuration, set the App ID and private-key location in `.env`, and edit the
-policy for the calling repository:
+policy for the calling repositories:
 
 ```bash
 cp .env.example .env

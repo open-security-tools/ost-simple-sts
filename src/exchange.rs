@@ -101,33 +101,41 @@ async fn verify_oidc_claims(
         return Err(AppError::InvalidOidcToken);
     }
 
-    if claims.subject.as_deref() != Some(config.policy.allowed_subject().as_str()) {
+    let mut rules = config.policy.rules().iter().collect::<Vec<_>>();
+    rules.retain(|rule| claims.subject.as_deref() == Some(rule.subject().as_str()));
+    if rules.is_empty() {
         return Err(AppError::SubjectNotAllowed);
     }
 
     let git_ref = claims.git_ref.ok_or(AppError::RefNotAllowed)?;
-    if git_ref != config.policy.allowed_ref().as_str() {
+    rules.retain(|rule| git_ref == rule.git_ref().as_str());
+    if rules.is_empty() {
         return Err(AppError::RefNotAllowed);
     }
 
-    if let Some(expected_environment) = config.policy.allowed_environment() {
-        if claims.environment.as_deref() != Some(expected_environment.as_str()) {
-            return Err(AppError::EnvironmentNotAllowed);
-        }
+    rules.retain(|rule| {
+        rule.environment().is_none_or(|expected_environment| {
+            claims.environment.as_deref() == Some(expected_environment.as_str())
+        })
+    });
+    if rules.is_empty() {
+        return Err(AppError::EnvironmentNotAllowed);
     }
 
     let repository = claims
         .repository
         .ok_or(AppError::RepositoryClaimMissing)
         .and_then(RepositoryFullName::try_from)?;
-    if repository != *config.policy.allowed_repository() {
+    rules.retain(|rule| repository == *rule.repository());
+    if rules.is_empty() {
         return Err(AppError::RepositoryNotAllowed);
     }
 
     let repository_id = claims
         .repository_id
         .ok_or(AppError::RepositoryIdClaimInvalid)?;
-    if repository_id != config.policy.allowed_repository_id() {
+    rules.retain(|rule| repository_id == rule.repository_id());
+    if rules.is_empty() {
         return Err(AppError::RepositoryIdNotAllowed);
     }
 
@@ -135,19 +143,20 @@ async fn verify_oidc_claims(
         return Err(AppError::EventNotAllowed);
     }
 
-    let expected_workflow_ref = format!(
-        "{repository}/{}@{}",
-        config.policy.allowed_workflow_path(),
-        config.policy.allowed_ref(),
-    );
-    if claims.workflow_ref.as_deref() != Some(expected_workflow_ref.as_str())
-        || claims
-            .job_workflow_ref
-            .as_deref()
-            .is_some_and(|workflow_ref| workflow_ref != expected_workflow_ref)
-    {
-        return Err(AppError::WorkflowNotAllowed);
-    }
+    rules.retain(|rule| {
+        let expected_workflow_ref = format!(
+            "{}/{workflow_path}@{git_ref}",
+            rule.repository(),
+            workflow_path = rule.workflow_path(),
+            git_ref = rule.git_ref(),
+        );
+        claims.workflow_ref.as_deref() == Some(expected_workflow_ref.as_str())
+            && claims
+                .job_workflow_ref
+                .as_deref()
+                .is_none_or(|workflow_ref| workflow_ref == expected_workflow_ref)
+    });
+    let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
 
     let jti = claims
         .jti
@@ -158,7 +167,7 @@ async fn verify_oidc_claims(
     Ok(VerifiedClaims {
         repository,
         repository_id,
-        git_ref: config.policy.allowed_ref().clone(),
+        git_ref: rule.git_ref().clone(),
         jti,
         expires_at_ms: exp.saturating_mul(1000) + CLOCK_TOLERANCE_SECONDS.saturating_mul(1000),
     })
@@ -420,12 +429,14 @@ mod integration_tests {
         fn policy(&self) -> Policy {
             serde_json::from_value(json!({
                 "expected_audience": self.server.uri(),
-                "allowed_subject": "repo:octo/tools:environment:release",
-                "allowed_repository": "octo/tools",
-                "allowed_repository_id": 42,
-                "allowed_ref": "refs/heads/main",
-                "allowed_workflow_path": ".github/workflows/release.yml",
-                "allowed_environment": "release"
+                "rules": [{
+                    "subject": "repo:octo/tools:environment:release",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "environment": "release"
+                }]
             }))
             .unwrap()
         }
@@ -497,6 +508,78 @@ mod integration_tests {
 
         assert_eq!(verified.repository.as_str(), "octo/tools");
         assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_another_policy_rule() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release"
+            }, {
+                "subject": "repo:octo/docs:environment:publish",
+                "repository": "octo/docs",
+                "repository_id": 43,
+                "ref": "refs/tags/v1",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "publish"
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:octo/docs:environment:publish");
+        claims["repository"] = json!("octo/docs");
+        claims["repository_id"] = json!(43);
+        claims["ref"] = json!("refs/tags/v1");
+        claims["workflow_ref"] = json!("octo/docs/.github/workflows/publish.yml@refs/tags/v1");
+        claims["environment"] = json!("publish");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+        assert_eq!(verified.repository.as_str(), "octo/docs");
+        assert_eq!(*verified.repository_id, 43);
+        assert_eq!(verified.git_ref.as_str(), "refs/tags/v1");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_a_cross_product_of_policy_rules() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release"
+            }, {
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/tags/v1",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "release"
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["workflow_ref"] = json!("octo/tools/.github/workflows/publish.yml@refs/heads/main");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::WorkflowNotAllowed));
     }
 
     #[tokio::test]
