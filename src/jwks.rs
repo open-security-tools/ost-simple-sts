@@ -49,7 +49,15 @@ impl JwksCache {
             let guard = self.inner.read().await;
             if let Some(cached) = guard.cached.as_ref() {
                 if cached.fetched_at.elapsed() < JWKS_TTL {
-                    return Self::find_key(&cached.jwk_set, kid).ok_or(AppError::InvalidOidcToken);
+                    if let Some(key) = Self::find_key(&cached.jwk_set, kid) {
+                        return Ok(key);
+                    }
+                    if guard
+                        .last_refresh_attempt
+                        .is_some_and(|attempted_at| attempted_at.elapsed() < JWKS_REFRESH_COOLDOWN)
+                    {
+                        return Err(AppError::InvalidOidcToken);
+                    }
                 }
             }
         }
@@ -57,7 +65,15 @@ impl JwksCache {
         let mut guard = self.inner.write().await;
         if let Some(cached) = guard.cached.as_ref() {
             if cached.fetched_at.elapsed() < JWKS_TTL {
-                return Self::find_key(&cached.jwk_set, kid).ok_or(AppError::InvalidOidcToken);
+                if let Some(key) = Self::find_key(&cached.jwk_set, kid) {
+                    return Ok(key);
+                }
+                if guard
+                    .last_refresh_attempt
+                    .is_some_and(|attempted_at| attempted_at.elapsed() < JWKS_REFRESH_COOLDOWN)
+                {
+                    return Err(AppError::InvalidOidcToken);
+                }
             }
         }
 
@@ -115,12 +131,12 @@ impl JwksCache {
 
 #[cfg(test)]
 mod tests {
-    use super::JwksCache;
+    use super::{CachedJwks, JwksCache, JWKS_REFRESH_COOLDOWN};
     use crate::error::AppError;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use rsa::traits::PublicKeyParts;
     use serde_json::json;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
@@ -230,6 +246,33 @@ mod tests {
         assert!(matches!(second, Err(AppError::InvalidOidcToken)));
         assert!(matches!(third, Err(AppError::InvalidOidcToken)));
         assert!(matches!(fourth, Err(AppError::InvalidOidcToken)));
+    }
+
+    #[tokio::test]
+    async fn decoding_key_for_refreshes_unknown_kid_after_cooldown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body("rotated-kid")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new_with_url(
+            test_http_client(),
+            format!("{}/.well-known/jwks", server.uri()),
+        );
+        {
+            let mut guard = cache.inner.write().await;
+            guard.cached = Some(CachedJwks {
+                fetched_at: Instant::now(),
+                jwk_set: serde_json::from_value(jwks_body("previous-kid")).unwrap(),
+            });
+            guard.last_refresh_attempt =
+                Some(Instant::now() - JWKS_REFRESH_COOLDOWN - Duration::from_secs(1));
+        }
+
+        cache.decoding_key_for("rotated-kid").await.unwrap();
     }
 
     #[tokio::test]
