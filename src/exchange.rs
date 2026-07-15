@@ -669,6 +669,21 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn verify_oidc_claims_rejects_tampered_signature() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+        let (header_and_claims, signature) = token.rsplit_once('.').unwrap();
+        let mut signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
+        signature[0] ^= 1;
+        let token = format!("{header_and_claims}.{}", URL_SAFE_NO_PAD.encode(signature));
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::InvalidOidcToken));
+    }
+
+    #[tokio::test]
     async fn verify_oidc_claims_rejects_future_not_before() {
         let fixture = TestFixture::new().await;
         let config = fixture.build_config(fixture.policy());

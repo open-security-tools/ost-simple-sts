@@ -3,7 +3,7 @@ description: Exchange a GitHub Actions OIDC token for a scoped GitHub App instal
 
 inputs:
   exchange-url:
-    description: Full URL of the simple-sts exchange endpoint.
+    description: Full HTTPS URL of the simple-sts exchange endpoint.
     required: true
   audience:
     description: OIDC audience configured in the simple-sts policy.
@@ -33,6 +33,11 @@ runs:
         OIDC_AUDIENCE: ${{ inputs.audience }}
       run: |
         set -euo pipefail
+
+        if [[ "$EXCHANGE_URL" != https://* ]]; then
+          echo "exchange-url must use HTTPS" >&2
+          exit 1
+        fi
 
         if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
           echo "id-token: write is required to request a GitHub OIDC token" >&2
