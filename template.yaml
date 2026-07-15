@@ -29,6 +29,10 @@ Parameters:
 Resources:
   Api:
     Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
 
   JtiTable:
     Type: AWS::DynamoDB::Table
@@ -52,6 +56,7 @@ Resources:
     Properties:
       CodeUri: .
       Handler: bootstrap
+      ReservedConcurrentExecutions: 100
       Environment:
         Variables:
           POLICY_JSON: !Ref PolicyJson
@@ -85,7 +90,7 @@ Resources:
             - Effect: Allow
               Action:
                 - secretsmanager:GetSecretValue
-              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}*
+              Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}-??????
 
 Outputs:
   ApiUrl:

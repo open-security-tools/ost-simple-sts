@@ -127,7 +127,8 @@ Policy denials return `403`, invalid or expired OIDC tokens return `401`, replay
 
 The included SAM template provisions one Lambda, one HTTP API, and one DynamoDB table with TTL for
 OIDC replay protection. The Lambda has permission to write replay records, read the App ID from SSM
-Parameter Store, and read the App private key from Secrets Manager.
+Parameter Store, and read only the named App private key from Secrets Manager. The public API is
+limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
 
 Create the local configuration, set the App ID and private-key location in `.env`, and edit the
 policy for the calling repository:
