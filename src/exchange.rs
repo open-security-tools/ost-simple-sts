@@ -1,14 +1,12 @@
 use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validation};
-use lambda_http::{http::header::AUTHORIZATION, Request, RequestExt};
+use lambda_http::{http::header::AUTHORIZATION, Request};
 use serde::Deserialize;
-use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
     config::{Config, GitRef},
     error::AppError,
-    github::{self, ExpiresInMinutes, Jti, RepositoryFullName, RepositoryId},
+    github::{self, Jti, RepositoryFullName, RepositoryId},
     replay,
 };
 
@@ -50,12 +48,6 @@ pub struct ExchangeResult {
 }
 
 pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, AppError> {
-    let expires_in = request
-        .query_string_parameters()
-        .first("expires_in")
-        .map(ExpiresInMinutes::try_from)
-        .transpose()?;
-
     let claims = verify_oidc_claims(&config, &request).await?;
 
     replay::claim_jti(
@@ -67,7 +59,7 @@ pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, 
     )
     .await?;
 
-    mint_installation_token(&config, &claims, expires_in).await
+    mint_installation_token(&config, &claims).await
 }
 
 async fn verify_oidc_claims(
@@ -172,7 +164,6 @@ async fn verify_oidc_claims(
 async fn mint_installation_token(
     config: &Config,
     claims: &VerifiedClaims,
-    expires_in_minutes: Option<ExpiresInMinutes>,
 ) -> Result<ExchangeResult, AppError> {
     let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
     let installation_id = github::find_installation(
@@ -184,18 +175,12 @@ async fn mint_installation_token(
     )
     .await?;
 
-    let expires_at = expires_in_minutes
-        .map(expires_at_from_minutes)
-        .transpose()?;
-
     let token = github::mint_installation_token(
         &config.http_client,
         &config.github_api_base,
         &app_jwt,
         installation_id,
-        &[*claims.repository_id],
-        json!({ "contents": "write" }),
-        expires_at.as_deref(),
+        *claims.repository_id,
     )
     .await?;
 
@@ -219,15 +204,6 @@ fn get_bearer_token(request: &Request) -> Option<&str> {
     } else {
         None
     }
-}
-
-fn expires_at_from_minutes(minutes: ExpiresInMinutes) -> Result<String, AppError> {
-    let expires_at = OffsetDateTime::now_utc()
-        .checked_add(Duration::minutes(minutes.get() as i64))
-        .ok_or(AppError::TokenExchangeFailed)?;
-    expires_at
-        .format(&Rfc3339)
-        .map_err(|_| AppError::TokenExchangeFailed)
 }
 
 fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
@@ -257,7 +233,7 @@ fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::get_bearer_token;
-    use crate::github::{ExpiresInMinutes, RepositoryFullName, RepositoryId};
+    use crate::github::{RepositoryFullName, RepositoryId};
     use lambda_http::{http::Request, Body};
 
     #[test]
@@ -285,19 +261,6 @@ mod tests {
     fn repository_id_rejects_invalid_values() {
         assert!(serde_json::from_str::<RepositoryId>(r#""zero""#).is_err());
         assert!(serde_json::from_str::<RepositoryId>("0").is_err());
-    }
-
-    #[test]
-    fn expires_in_accepts_valid_range() {
-        assert_eq!(ExpiresInMinutes::try_from("10").unwrap().get(), 10);
-        assert_eq!(ExpiresInMinutes::try_from("60").unwrap().get(), 60);
-    }
-
-    #[test]
-    fn expires_in_rejects_invalid_values() {
-        assert!(ExpiresInMinutes::try_from("9").is_err());
-        assert!(ExpiresInMinutes::try_from("61").is_err());
-        assert!(ExpiresInMinutes::try_from("abc").is_err());
     }
 
     #[test]

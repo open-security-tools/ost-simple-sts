@@ -18,8 +18,6 @@ pub enum AppError {
     NotFound,
     #[error("missing bearer token")]
     MissingBearerToken,
-    #[error("invalid expires_in")]
-    InvalidExpiresIn,
     #[error("oidc token expired")]
     OidcTokenExpired,
     #[error("invalid oidc token")]
@@ -70,8 +68,6 @@ pub enum AppError {
     InstallationTokenRequestInvalid,
     #[error("github access token request failed")]
     GithubAccessTokenRequestFailed,
-    #[error("token exchange failed")]
-    TokenExchangeFailed,
 }
 
 impl AppError {
@@ -85,7 +81,6 @@ impl AppError {
             Self::InvalidGithubApiUrl => "invalid_github_api_url",
             Self::NotFound => "not_found",
             Self::MissingBearerToken => "missing_bearer_token",
-            Self::InvalidExpiresIn => "invalid_expires_in",
             Self::OidcTokenExpired => "oidc_token_expired",
             Self::InvalidOidcToken => "invalid_oidc_token",
             Self::OidcVerificationUnavailable => "oidc_verification_unavailable",
@@ -111,7 +106,6 @@ impl AppError {
             Self::InstallationNotFound => "installation_not_found",
             Self::InstallationTokenRequestInvalid => "installation_token_request_invalid",
             Self::GithubAccessTokenRequestFailed => "github_access_token_request_failed",
-            Self::TokenExchangeFailed => "token_exchange_failed",
         }
     }
 
@@ -122,15 +116,13 @@ impl AppError {
             | Self::AppIdNotConfigured
             | Self::AppPrivateKeyNotConfigured
             | Self::JtiTableNotConfigured
-            | Self::InvalidGithubApiUrl
-            | Self::TokenExchangeFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::InvalidGithubApiUrl => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MissingBearerToken
             | Self::OidcTokenExpired
             | Self::OidcTokenMissingJti
             | Self::OidcTokenMissingExp
             | Self::InvalidOidcToken => StatusCode::UNAUTHORIZED,
-            Self::InvalidExpiresIn => StatusCode::BAD_REQUEST,
             Self::OidcVerificationUnavailable | Self::JtiReplayGuardUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
