@@ -5,17 +5,10 @@ use std::{
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::api::{github_api_url, github_request, send_github_request, GithubApiBase};
 use crate::error::AppError;
-
-const MIN_TOKEN_LIFETIME_MINUTES: u64 = 10;
-const MAX_TOKEN_LIFETIME_MINUTES: u64 = 60;
-
-/// Stores a requested installation-token lifetime in minutes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExpiresInMinutes(u64);
 
 /// Wraps a sensitive GitHub access token while redacting debug and display output.
 #[derive(Clone, PartialEq, Eq)]
@@ -38,26 +31,6 @@ struct AppJwtClaims<'a> {
 #[derive(Debug, Deserialize)]
 struct RepositoryInstallation {
     id: u64,
-}
-
-impl ExpiresInMinutes {
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl TryFrom<&str> for ExpiresInMinutes {
-    type Error = AppError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let value = value
-            .parse::<u64>()
-            .map_err(|_| AppError::InvalidExpiresIn)?;
-        if !(MIN_TOKEN_LIFETIME_MINUTES..=MAX_TOKEN_LIFETIME_MINUTES).contains(&value) {
-            return Err(AppError::InvalidExpiresIn);
-        }
-        Ok(Self(value))
-    }
 }
 
 impl Token {
@@ -161,31 +134,25 @@ pub async fn mint_installation_token(
     github_api_base: &GithubApiBase,
     app_jwt: &str,
     installation_id: u64,
-    repository_ids: &[u64],
-    permissions: Value,
-    expires_at: Option<&str>,
+    repository_id: u64,
 ) -> Result<InstallationToken, AppError> {
     let url = github_api_url(
         github_api_base,
         &format!("app/installations/{installation_id}/access_tokens"),
     )?;
-    let mut payload = json!({
-        "repository_ids": repository_ids,
-        "permissions": permissions,
+    let payload = json!({
+        "repository_ids": [repository_id],
+        "permissions": { "contents": "write" },
     });
-    if let Some(expires_at) = expires_at {
-        payload["expires_at"] = Value::String(expires_at.to_string());
-    }
 
-    let response = send_github_request(
-        github_request(http_client.post(url), app_jwt).json(&payload),
-        "installation token request",
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(?error, "installation token request failed");
-        AppError::GithubAccessTokenRequestFailed
-    })?;
+    let response = github_request(http_client.post(url), app_jwt)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, "installation token request failed");
+            AppError::GithubAccessTokenRequestFailed
+        })?;
 
     match response.status().as_u16() {
         201 => response.json::<InstallationToken>().await.map_err(|error| {
@@ -211,17 +178,8 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    use super::{find_installation, mint_installation_token, ExpiresInMinutes, Token};
+    use super::{find_installation, mint_installation_token, Token};
     use crate::{error::AppError, github::GithubApiBase};
-
-    #[test]
-    fn expires_in_accepts_the_supported_range() {
-        assert_eq!(ExpiresInMinutes::try_from("10").unwrap().get(), 10);
-        assert_eq!(ExpiresInMinutes::try_from("60").unwrap().get(), 60);
-        assert!(ExpiresInMinutes::try_from("9").is_err());
-        assert!(ExpiresInMinutes::try_from("61").is_err());
-        assert!(ExpiresInMinutes::try_from("abc").is_err());
-    }
 
     #[test]
     fn token_debug_and_display_are_redacted() {
@@ -331,9 +289,7 @@ mod tests {
             &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
             "app-jwt",
             123,
-            &[42],
-            json!({ "contents": "write" }),
-            None,
+            42,
         )
         .await
         .unwrap();
@@ -342,38 +298,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_transient_token_request_failure() {
+    async fn does_not_retry_token_creation() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/app/installations/123/access_tokens"))
             .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/app/installations/123/access_tokens"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
-                "token": "ghs_retry",
-                "expires_at": "2026-03-28T00:00:00Z"
-            })))
             .expect(1)
             .mount(&server)
             .await;
 
-        let token = mint_installation_token(
+        let error = mint_installation_token(
             &reqwest::Client::new(),
             &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
             "app-jwt",
             123,
-            &[42],
-            json!({ "contents": "write" }),
-            None,
+            42,
         )
         .await
-        .unwrap();
-        assert_eq!(token.token.as_str(), "ghs_retry");
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        .unwrap_err();
+        assert!(matches!(error, AppError::GithubAccessTokenRequestFailed));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -398,9 +342,7 @@ mod tests {
                 &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
                 "app-jwt",
                 999,
-                &[1],
-                json!({ "contents": "write" }),
-                None,
+                1,
             )
             .await
             .unwrap_err();

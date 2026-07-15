@@ -57,6 +57,6 @@ Key validated domain types
 
 - `Policy`, `Audience`, `GitRef`, `WorkflowPath`, `EnvironmentName`
 - `RepositoryFullName`, `RepositoryOwner`, `RepositoryNamePart`, `RepositoryId`
-- `GithubApiBase`, `JtiTableName`, `Jti`, `ExpiresInMinutes`
+- `GithubApiBase`, `JtiTableName`, `Jti`
 
 These types reduce stringly-typed checks across the request path.
