@@ -7,7 +7,11 @@ use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
 use serde::Deserialize;
 
-use crate::{error::AppError, github::GithubApiBase, jwks::JwksCache};
+use crate::{
+    error::AppError,
+    github::{GithubApiBase, RepositoryFullName, RepositoryId},
+    jwks::JwksCache,
+};
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -17,14 +21,21 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 #[serde(try_from = "RawPolicy")]
 pub struct Policy {
     expected_audience: Audience,
+    allowed_subject: Subject,
+    allowed_repository: RepositoryFullName,
+    allowed_repository_id: RepositoryId,
     allowed_ref: GitRef,
     allowed_workflow_path: WorkflowPath,
     allowed_environment: Option<EnvironmentName>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawPolicy {
     expected_audience: String,
+    allowed_subject: String,
+    allowed_repository: String,
+    allowed_repository_id: RepositoryId,
     allowed_ref: String,
     allowed_workflow_path: String,
     #[serde(default)]
@@ -33,6 +44,9 @@ struct RawPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Audience(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subject(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRef(String);
@@ -69,6 +83,7 @@ fn is_valid_workflow_path(value: &str) -> bool {
 }
 
 crate::impl_string_newtype!(Audience, AppError, AppError::InvalidPolicy);
+crate::impl_string_newtype!(Subject, AppError, AppError::InvalidPolicy);
 crate::impl_string_newtype!(
     GitRef,
     AppError,
@@ -130,6 +145,18 @@ impl Policy {
         &self.expected_audience
     }
 
+    pub fn allowed_subject(&self) -> &Subject {
+        &self.allowed_subject
+    }
+
+    pub fn allowed_repository(&self) -> &RepositoryFullName {
+        &self.allowed_repository
+    }
+
+    pub fn allowed_repository_id(&self) -> RepositoryId {
+        self.allowed_repository_id
+    }
+
     pub fn allowed_ref(&self) -> &GitRef {
         &self.allowed_ref
     }
@@ -162,6 +189,12 @@ impl TryFrom<RawPolicy> for Policy {
     fn try_from(raw: RawPolicy) -> Result<Self, Self::Error> {
         Ok(Self {
             expected_audience: raw.expected_audience.try_into()?,
+            allowed_subject: raw.allowed_subject.try_into()?,
+            allowed_repository: raw
+                .allowed_repository
+                .try_into()
+                .map_err(|_| AppError::InvalidPolicy)?,
+            allowed_repository_id: raw.allowed_repository_id,
             allowed_ref: raw.allowed_ref.try_into()?,
             allowed_workflow_path: raw.allowed_workflow_path.try_into()?,
             allowed_environment: raw.allowed_environment.map(TryInto::try_into).transpose()?,
@@ -291,6 +324,9 @@ mod tests {
     fn policy_deserializes_into_validated_types() {
         let policy: Policy = serde_json::from_value(json!({
             "expected_audience": "https://example.com",
+            "allowed_subject": "repo:octo/tools:environment:release",
+            "allowed_repository": "octo/tools",
+            "allowed_repository_id": 42,
             "allowed_ref": "refs/heads/main",
             "allowed_workflow_path": ".github/workflows/release.yml",
             "allowed_environment": "release"
@@ -298,6 +334,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.expected_audience().as_str(), "https://example.com");
+        assert_eq!(
+            policy.allowed_subject().as_str(),
+            "repo:octo/tools:environment:release"
+        );
+        assert_eq!(policy.allowed_repository().as_str(), "octo/tools");
+        assert_eq!(*policy.allowed_repository_id(), 42);
         assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
         assert_eq!(
             policy.allowed_workflow_path().as_str(),
@@ -309,6 +351,9 @@ mod tests {
     fn policy_from_str_works() {
         let policy: Policy = r#"{
             "expected_audience": "https://example.com",
+            "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
+            "allowed_repository": "octo/tools",
+            "allowed_repository_id": "42",
             "allowed_ref": "refs/heads/main",
             "allowed_workflow_path": ".github/workflows/release.yml"
         }"#
@@ -321,10 +366,44 @@ mod tests {
     fn policy_rejects_empty_strings() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "expected_audience": "",
+            "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
+            "allowed_repository": "octo/tools",
+            "allowed_repository_id": 42,
             "allowed_ref": "refs/heads/main",
             "allowed_workflow_path": ".github/workflows/release.yml"
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_rejects_unknown_fields() {
+        let result: Result<Policy, _> = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "allowed_subject": "repo:octo/tools:environment:release",
+            "allowed_repository": "octo/tools",
+            "allowed_repository_id": 42,
+            "allowed_ref": "refs/heads/main",
+            "allowed_workflow_path": ".github/workflows/release.yml",
+            "allowed_enviroment": "release"
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_rejects_invalid_repository_identity() {
+        for (repository, repository_id) in [("octo", 42), ("octo/tools", 0)] {
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
+                "allowed_repository": repository,
+                "allowed_repository_id": repository_id,
+                "allowed_ref": "refs/heads/main",
+                "allowed_workflow_path": ".github/workflows/release.yml"
+            }));
+
+            assert!(result.is_err());
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validati
 use lambda_http::{http::header::AUTHORIZATION, Request, RequestExt};
 use serde::Deserialize;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
@@ -13,9 +14,12 @@ use crate::{
 
 const ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const CLOCK_TOLERANCE_SECONDS: u64 = 5;
+const MAX_OIDC_TOKEN_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubActionsClaims {
+    #[serde(rename = "sub")]
+    subject: Option<String>,
     repository: Option<String>,
     repository_id: Option<RepositoryId>,
     #[serde(rename = "ref")]
@@ -25,6 +29,7 @@ struct GitHubActionsClaims {
     job_workflow_ref: Option<String>,
     environment: Option<String>,
     jti: Option<String>,
+    iat: Option<u64>,
     exp: Option<u64>,
 }
 
@@ -83,11 +88,30 @@ async fn verify_oidc_claims(
     validation.set_issuer(&[ACTIONS_ISSUER]);
     validation.set_audience(&[config.policy.expected_audience().as_str()]);
     validation.leeway = CLOCK_TOLERANCE_SECONDS;
-    validation.validate_nbf = false;
+    validation.validate_nbf = true;
+    validation.required_spec_claims = ["iss", "sub", "aud", "exp", "nbf", "iat"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
     let claims = decode::<GitHubActionsClaims>(oidc_token, &decoding_key, &validation)
         .map_err(map_jwt_error)?
         .claims;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::OidcVerificationUnavailable)?
+        .as_secs();
+    if claims
+        .iat
+        .is_none_or(|issued_at| issued_at > now.saturating_add(CLOCK_TOLERANCE_SECONDS))
+    {
+        return Err(AppError::InvalidOidcToken);
+    }
+
+    if claims.subject.as_deref() != Some(config.policy.allowed_subject().as_str()) {
+        return Err(AppError::SubjectNotAllowed);
+    }
 
     let git_ref = claims.git_ref.ok_or(AppError::RefNotAllowed)?;
     if git_ref != config.policy.allowed_ref().as_str() {
@@ -104,6 +128,16 @@ async fn verify_oidc_claims(
         .repository
         .ok_or(AppError::RepositoryClaimMissing)
         .and_then(RepositoryFullName::try_from)?;
+    if repository != *config.policy.allowed_repository() {
+        return Err(AppError::RepositoryNotAllowed);
+    }
+
+    let repository_id = claims
+        .repository_id
+        .ok_or(AppError::RepositoryIdClaimInvalid)?;
+    if repository_id != config.policy.allowed_repository_id() {
+        return Err(AppError::RepositoryIdNotAllowed);
+    }
 
     if claims.event_name.as_deref() != Some("workflow_dispatch") {
         return Err(AppError::EventNotAllowed);
@@ -120,9 +154,6 @@ async fn verify_oidc_claims(
         return Err(AppError::WorkflowNotAllowed);
     }
 
-    let repository_id = claims
-        .repository_id
-        .ok_or(AppError::RepositoryIdClaimInvalid)?;
     let jti = claims
         .jti
         .ok_or(AppError::OidcTokenMissingJti)
@@ -179,7 +210,11 @@ async fn mint_installation_token(
 fn get_bearer_token(request: &Request) -> Option<&str> {
     let authorization = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = authorization.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() {
+    if scheme.eq_ignore_ascii_case("bearer")
+        && !token.is_empty()
+        && token.len() <= MAX_OIDC_TOKEN_BYTES
+        && !token.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
         Some(token)
     } else {
         None
@@ -306,6 +341,27 @@ mod tests {
             .unwrap();
         assert_eq!(get_bearer_token(&request), None);
     }
+
+    #[test]
+    fn get_bearer_token_rejects_whitespace_in_token() {
+        let request = Request::builder()
+            .header("authorization", "Bearer token with-spaces")
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), None);
+    }
+
+    #[test]
+    fn get_bearer_token_rejects_oversized_token() {
+        let request = Request::builder()
+            .header(
+                "authorization",
+                format!("Bearer {}", "a".repeat(super::MAX_OIDC_TOKEN_BYTES + 1)),
+            )
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), None);
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +454,9 @@ mod integration_tests {
         fn policy(&self) -> Policy {
             serde_json::from_value(json!({
                 "expected_audience": self.server.uri(),
+                "allowed_subject": "repo:octo/tools:environment:release",
+                "allowed_repository": "octo/tools",
+                "allowed_repository_id": 42,
                 "allowed_ref": "refs/heads/main",
                 "allowed_workflow_path": ".github/workflows/release.yml",
                 "allowed_environment": "release"
@@ -409,6 +468,7 @@ mod integration_tests {
             let now = self.now_secs();
             json!({
                 "iss": ACTIONS_ISSUER,
+                "sub": "repo:octo/tools:environment:release",
                 "aud": self.server.uri(),
                 "iat": now - 10,
                 "nbf": now - 10,
@@ -518,6 +578,45 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_subject() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:octo/other:environment:release");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::SubjectNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_repository() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["repository"] = json!("octo/other");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::RepositoryNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_repository_id() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["repository_id"] = json!(43);
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::RepositoryIdNotAllowed));
+    }
+
+    #[tokio::test]
     async fn verify_oidc_claims_rejects_wrong_environment() {
         let fixture = TestFixture::new().await;
         let policy = fixture.policy();
@@ -573,6 +672,45 @@ mod integration_tests {
 
         let error = verify_oidc_claims(&config, &request).await.unwrap_err();
         assert!(matches!(error, AppError::OidcTokenExpired));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_future_not_before() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["nbf"] = json!(fixture.now_secs() + 60);
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::InvalidOidcToken));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_future_issued_at() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["iat"] = json!(fixture.now_secs() + 60);
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::InvalidOidcToken));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_missing_required_claim() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims.as_object_mut().unwrap().remove("nbf");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::InvalidOidcToken));
     }
 
     #[tokio::test]

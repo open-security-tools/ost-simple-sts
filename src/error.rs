@@ -38,16 +38,22 @@ pub enum AppError {
     RefNotAllowed,
     #[error("environment is not allowed")]
     EnvironmentNotAllowed,
+    #[error("subject is not allowed")]
+    SubjectNotAllowed,
     #[error("repository claim missing")]
     RepositoryClaimMissing,
     #[error("invalid repository claim")]
     RepositoryClaimInvalid,
+    #[error("repository is not allowed")]
+    RepositoryNotAllowed,
     #[error("only workflow_dispatch events are allowed")]
     EventNotAllowed,
     #[error("workflow is not allowed")]
     WorkflowNotAllowed,
     #[error("repository_id claim missing or invalid")]
     RepositoryIdClaimInvalid,
+    #[error("repository_id is not allowed")]
+    RepositoryIdNotAllowed,
     #[error("github app authentication failed")]
     GithubAppAuthInvalid,
     #[error("github rejected installation lookup")]
@@ -89,11 +95,14 @@ impl AppError {
             Self::JtiReplayGuardUnavailable => "jti_replay_guard_unavailable",
             Self::RefNotAllowed => "ref_not_allowed",
             Self::EnvironmentNotAllowed => "environment_not_allowed",
+            Self::SubjectNotAllowed => "subject_not_allowed",
             Self::RepositoryClaimMissing => "repository_claim_missing",
             Self::RepositoryClaimInvalid => "repository_claim_invalid",
+            Self::RepositoryNotAllowed => "repository_not_allowed",
             Self::EventNotAllowed => "event_not_allowed",
             Self::WorkflowNotAllowed => "workflow_not_allowed",
             Self::RepositoryIdClaimInvalid => "repository_id_claim_invalid",
+            Self::RepositoryIdNotAllowed => "repository_id_not_allowed",
             Self::GithubAppAuthInvalid => "github_app_auth_invalid",
             Self::GithubInstallationLookupForbidden => "github_installation_lookup_forbidden",
             Self::AppNotInstalled => "app_not_installed",
@@ -128,11 +137,14 @@ impl AppError {
             Self::OidcTokenReplayed => StatusCode::CONFLICT,
             Self::RefNotAllowed
             | Self::EnvironmentNotAllowed
+            | Self::SubjectNotAllowed
             | Self::RepositoryClaimMissing
             | Self::RepositoryClaimInvalid
+            | Self::RepositoryNotAllowed
             | Self::EventNotAllowed
             | Self::WorkflowNotAllowed
             | Self::RepositoryIdClaimInvalid
+            | Self::RepositoryIdNotAllowed
             | Self::AppNotInstalled
             | Self::InstallationNotFound => StatusCode::FORBIDDEN,
             Self::GithubAppAuthInvalid

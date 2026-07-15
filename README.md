@@ -37,6 +37,9 @@ Example policy:
 ```json
 {
   "expected_audience": "https://example.execute-api.us-east-1.amazonaws.com",
+  "allowed_subject": "repo:example-org@123456/example-repo@789012:environment:release",
+  "allowed_repository": "example-org/example-repo",
+  "allowed_repository_id": 789012,
   "allowed_ref": "refs/heads/main",
   "allowed_workflow_path": ".github/workflows/release.yml",
   "allowed_environment": "release"
