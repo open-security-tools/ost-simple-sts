@@ -9,7 +9,7 @@ Globals:
     Runtime: provided.al2023
     Architectures:
       - arm64
-    Timeout: 10
+    Timeout: 30
     MemorySize: 256
 
 Parameters:
@@ -72,9 +72,11 @@ Resources:
             Path: /exchange
             Method: POST
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref JtiTable
         - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt JtiTable.Arn
             - Effect: Allow
               Action:
                 - ssm:GetParameter
