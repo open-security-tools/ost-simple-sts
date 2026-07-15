@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+#
+# Sync secrets from .env into AWS SSM Parameter Store and Secrets Manager.
+#
+# Usage:
+#   ./scripts/deploy-secrets.sh              # uses .env in project root
+#   ENV_FILE=/path/to/.env ./scripts/deploy-secrets.sh
+#
+# Required .env variables:
+#   APP_ID                      GitHub App ID or Client ID
+#   APP_ID_PARAMETER            SSM parameter name (e.g. /ost-sts/app-id)
+#   APP_PRIVATE_KEY_SECRET_NAME Secrets Manager secret name (e.g. ost-sts/app-private-key)
+#
+# Private key source (one required):
+#   APP_PRIVATE_KEY_FILE        Path to a PEM file (preferred)
+#   APP_PRIVATE_KEY             Inline PEM value (fallback)
+#
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -80,9 +96,6 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-
-APP_ID_PARAMETER="${APP_ID_PARAMETER:-/ost/app-id}"
-APP_PRIVATE_KEY_SECRET_NAME="${APP_PRIVATE_KEY_SECRET_NAME:-}"
 
 require_var APP_ID
 require_var APP_ID_PARAMETER

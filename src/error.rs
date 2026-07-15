@@ -1,4 +1,4 @@
-use lambda_http::{http::StatusCode, Body, Error, Response};
+use lambda_http::http::StatusCode;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -14,6 +14,8 @@ pub enum AppError {
     JtiTableNotConfigured,
     #[error("github api url is invalid")]
     InvalidGithubApiUrl,
+    #[error("not found")]
+    NotFound,
     #[error("missing bearer token")]
     MissingBearerToken,
     #[error("invalid expires_in")]
@@ -75,6 +77,7 @@ impl AppError {
             Self::AppPrivateKeyNotConfigured => "app_private_key_not_configured",
             Self::JtiTableNotConfigured => "jti_table_not_configured",
             Self::InvalidGithubApiUrl => "invalid_github_api_url",
+            Self::NotFound => "not_found",
             Self::MissingBearerToken => "missing_bearer_token",
             Self::InvalidExpiresIn => "invalid_expires_in",
             Self::OidcTokenExpired => "oidc_token_expired",
@@ -112,12 +115,13 @@ impl AppError {
             | Self::JtiTableNotConfigured
             | Self::InvalidGithubApiUrl
             | Self::TokenExchangeFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NotFound => StatusCode::NOT_FOUND,
             Self::MissingBearerToken
             | Self::OidcTokenExpired
             | Self::OidcTokenMissingJti
-            | Self::OidcTokenMissingExp => StatusCode::UNAUTHORIZED,
+            | Self::OidcTokenMissingExp
+            | Self::InvalidOidcToken => StatusCode::UNAUTHORIZED,
             Self::InvalidExpiresIn => StatusCode::BAD_REQUEST,
-            Self::InvalidOidcToken => StatusCode::UNAUTHORIZED,
             Self::OidcVerificationUnavailable | Self::JtiReplayGuardUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -139,13 +143,5 @@ impl AppError {
             }
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
         }
-    }
-
-    pub fn into_response(self) -> Result<Response<Body>, Error> {
-        crate::http::json_error(
-            self.status().as_u16(),
-            self.code(),
-            self.to_string().as_str(),
-        )
     }
 }

@@ -1,36 +1,36 @@
 # ost-simple-sts
 
-Rust AWS Lambda service that exchanges a GitHub Actions OIDC token for a
-short-lived GitHub App installation token.
+`ost-simple-sts` is a Rust AWS Lambda service that exchanges a GitHub Actions
+OIDC token for a short-lived GitHub App installation token.
+
+It is intended for workflows that should not carry long-lived GitHub App
+credentials, and instead mint narrowly scoped installation tokens only after
+policy checks pass.
 
 ## Endpoints
 
 - `GET /health`
 - `POST /exchange`
 
-## Security model
+## Exchange lifecycle
 
-`POST /exchange`:
+`POST /exchange` performs the following checks and actions:
 
-- verifies the GitHub Actions OIDC JWT against GitHub's JWKS
-- requires `iss = https://token.actions.githubusercontent.com`
-- requires the configured OIDC audience
-- requires a specific git ref
-- optionally requires a specific GitHub Actions environment
-- requires a specific workflow identity via `workflow_ref` or `job_workflow_ref`
-- rejects replayed `jti` values via DynamoDB conditional writes + TTL
-- looks up the GitHub App installation for the caller repository
-- mints a repository-scoped installation token with `contents: write`
+1. Read bearer token from `Authorization: Bearer <oidc-jwt>`
+2. Verify OIDC JWT signature with GitHub Actions JWKS (`RS256`)
+3. Enforce issuer: `https://token.actions.githubusercontent.com`
+4. Enforce configured OIDC audience
+5. Enforce configured ref (for example `refs/heads/main`)
+6. Optionally enforce configured environment
+7. Enforce `workflow_dispatch` event
+8. Enforce workflow identity (`workflow_ref` or `job_workflow_ref`)
+9. Claim the OIDC `jti` in DynamoDB to prevent replay
+10. Authenticate as GitHub App and resolve repository installation
+11. Mint a repository-scoped installation token (`contents: write`)
 
-## Configuration
+## Policy configuration
 
-Runtime configuration comes from:
-
-- `POLICY_JSON`
-- `APP_ID` or `APP_ID_PARAMETER`
-- `APP_PRIVATE_KEY` or `APP_PRIVATE_KEY_SECRET_NAME`
-- `JTI_TABLE_NAME`
-- optional `GITHUB_API_URL`
+`POLICY_JSON` is required and defines exchange policy.
 
 Example policy:
 
@@ -43,21 +43,33 @@ Example policy:
 }
 ```
 
-## Secrets
+`allowed_environment` is optional.
 
-Recommended AWS storage:
+## Runtime configuration
 
-- `APP_ID` → SSM SecureString
-- `APP_PRIVATE_KEY` → Secrets Manager
+Values are loaded from env / AWS stores:
 
-Direct environment variables are also supported for local development.
+- `POLICY_JSON`
+- `APP_ID` or `APP_ID_PARAMETER` (SSM)
+- `APP_PRIVATE_KEY` or `APP_PRIVATE_KEY_SECRET_NAME` / `APP_PRIVATE_KEY_SECRET_ARN` (Secrets Manager)
+- `JTI_TABLE_NAME`
+- optional `GITHUB_API_URL` (defaults to `https://api.github.com/`)
 
-## GitHub App permissions
+## GitHub App requirements
 
-The GitHub App needs:
+Repository permissions:
 
 - **Contents**: read and write
 - **Metadata**: read-only
+
+The App must be installed on repositories that are allowed to exchange tokens.
+
+## Security notes
+
+- OIDC verification uses cached GitHub JWKS keys
+- replay protection uses DynamoDB conditional writes + TTL
+- all external GitHub API requests use short timeouts and retry transient failures
+- sensitive values (private key/token) are redacted in debug output
 
 ## Local development
 
@@ -66,13 +78,7 @@ cargo test
 cargo fmt
 ```
 
-## Deployment
-
-This repo uses AWS SAM and `cargo-lambda`.
-
-```bash
-sam build --beta-features --no-use-container
-```
+## Deployment (AWS SAM + cargo-lambda)
 
 Recommended workflow:
 
@@ -84,20 +90,22 @@ make deploy-secrets
 make deploy
 ```
 
-- `make deploy-secrets` syncs the SSM parameter and Secrets Manager secret from `.env`
-- `make deploy` reads `.env`, compacts `POLICY_FILE` with `jq -c`, and runs `sam deploy`
+- `make deploy-secrets` syncs App ID + private key into AWS
+- `make deploy` compacts policy JSON and deploys the SAM stack
 
-The preferred `.env` input is `APP_PRIVATE_KEY_FILE=.secrets/github-app-private-key.pem`.
-A fallback inline `APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...` value also works.
+Supported `.env` key sources:
 
-Optional overrides in `.env`:
+- preferred: `APP_PRIVATE_KEY_FILE=.secrets/github-app-private-key.pem`
+- fallback: inline `APP_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...'`
+
+Optional `.env` overrides:
 
 - `APP_ID_PARAMETER=/ost/app-id`
 - `JTI_TABLE_NAME=ost-jti-replay`
 - `STACK_NAME=ost-simple-sts`
 - `POLICY_FILE=policy.json`
 
-You can also point to a different env file:
+Use a different env file when needed:
 
 ```bash
 ENV_FILE=/path/to/.env make deploy-secrets
@@ -107,8 +115,39 @@ ENV_FILE=/path/to/.env make deploy
 The included `template.yaml` provisions:
 
 - one Lambda function
-- one HTTP API
+- one HTTP API (`/health`, `/exchange`)
 - one DynamoDB table for OIDC `jti` replay protection
+
+## GitHub Actions caller requirements
+
+Workflows calling `/exchange` must request an OIDC token:
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+```
+
+The exchange route only accepts identity from `workflow_dispatch` runs whose
+`ref`, workflow path, and (optionally) environment match policy.
+
+## Error response contract
+
+All errors return JSON with this shape:
+
+```json
+{
+  "code": "machine_readable_error_code",
+  "error": "human readable message"
+}
+```
+
+Examples:
+
+- missing bearer token: `401 missing_bearer_token`
+- wrong ref/environment/workflow: `403 ref_not_allowed|environment_not_allowed|workflow_not_allowed`
+- replayed token: `409 oidc_token_replayed`
+- GitHub upstream failure: `502 github_installation_lookup_failed|github_access_token_request_failed`
 
 ## Action usage
 
@@ -120,3 +159,7 @@ Point `ost-simple-sts-action` at the deployed exchange endpoint:
   with:
     url: https://<api-id>.execute-api.<region>.amazonaws.com/exchange
 ```
+
+## Architecture notes
+
+For a module-by-module map, see [`OVERVIEW.md`](./OVERVIEW.md).

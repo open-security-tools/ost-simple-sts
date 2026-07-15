@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, fmt, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
@@ -7,13 +7,11 @@ use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
 use serde::Deserialize;
 
-use crate::{
-    error::AppError,
-    jwks::JwksCache,
-    types::{AppId, AppPrivateKey, Audience, EnvironmentName, GitRef, JtiTableName, WorkflowPath},
-};
+use crate::{error::AppError, github::GithubApiBase, jwks::JwksCache};
 
-const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com/";
+const WORKFLOWS_PREFIX: &str = ".github/workflows/";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "RawPolicy")]
@@ -31,6 +29,100 @@ struct RawPolicy {
     allowed_workflow_path: String,
     #[serde(default)]
     allowed_environment: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Audience(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRef(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowPath(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentName(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppId(String);
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AppPrivateKey(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JtiTableName(String);
+
+fn is_valid_git_ref(value: &str) -> bool {
+    value
+        .strip_prefix("refs/heads/")
+        .is_some_and(|suffix| !suffix.is_empty())
+        || value
+            .strip_prefix("refs/tags/")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+fn is_valid_workflow_path(value: &str) -> bool {
+    value
+        .strip_prefix(WORKFLOWS_PREFIX)
+        .is_some_and(|suffix| !suffix.is_empty())
+        && (value.ends_with(".yml") || value.ends_with(".yaml"))
+}
+
+crate::impl_string_newtype!(Audience, AppError, AppError::InvalidPolicy);
+crate::impl_string_newtype!(
+    GitRef,
+    AppError,
+    AppError::InvalidPolicy,
+    validate = is_valid_git_ref
+);
+crate::impl_string_newtype!(
+    WorkflowPath,
+    AppError,
+    AppError::InvalidPolicy,
+    validate = is_valid_workflow_path
+);
+crate::impl_string_newtype!(EnvironmentName, AppError, AppError::InvalidPolicy);
+crate::impl_string_newtype!(AppId, AppError, AppError::AppIdNotConfigured);
+crate::impl_string_newtype!(JtiTableName, AppError, AppError::JtiTableNotConfigured);
+
+impl fmt::Debug for AppPrivateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AppPrivateKey").field(&"<redacted>").finish()
+    }
+}
+
+impl AppPrivateKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_env() -> Result<Self, AppError> {
+        env::var("APP_PRIVATE_KEY")
+            .map_err(|_| AppError::AppPrivateKeyNotConfigured)
+            .and_then(Self::try_from)
+    }
+
+    async fn from_secrets_manager(secrets: &SecretsManagerClient) -> Result<Self, Error> {
+        let secret_id = env::var("APP_PRIVATE_KEY_SECRET_NAME")
+            .or_else(|_| env::var("APP_PRIVATE_KEY_SECRET_ARN"))
+            .map_err(|_| AppError::AppPrivateKeyNotConfigured)?;
+        let response = secrets
+            .get_secret_value()
+            .secret_id(secret_id)
+            .send()
+            .await?;
+        let value = response
+            .secret_string()
+            .ok_or(AppError::AppPrivateKeyNotConfigured)?;
+
+        Self::try_from(value.to_owned()).map_err(Into::into)
+    }
+}
+
+impl AsRef<str> for AppPrivateKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
 }
 
 impl Policy {
@@ -78,14 +170,13 @@ impl TryFrom<RawPolicy> for Policy {
 }
 
 impl AppId {
-    async fn from_env_or_ssm(ssm: &SsmClient) -> Result<Self, Error> {
-        if let Ok(app_id) = env::var("APP_ID") {
-            let trimmed = app_id.trim();
-            if !trimmed.is_empty() {
-                return Self::try_from(trimmed).map_err(Into::into);
-            }
-        }
+    fn from_env() -> Result<Self, AppError> {
+        env::var("APP_ID")
+            .map_err(|_| AppError::AppIdNotConfigured)
+            .and_then(Self::try_from)
+    }
 
+    async fn from_ssm(ssm: &SsmClient) -> Result<Self, Error> {
         let parameter_name =
             env::var("APP_ID_PARAMETER").map_err(|_| AppError::AppIdNotConfigured)?;
         let response = ssm
@@ -99,32 +190,7 @@ impl AppId {
             .and_then(|parameter| parameter.value())
             .ok_or(AppError::AppIdNotConfigured)?;
 
-        Self::try_from(value).map_err(Into::into)
-    }
-}
-
-impl AppPrivateKey {
-    async fn from_env_or_secret(secrets: &SecretsManagerClient) -> Result<Self, Error> {
-        if let Ok(value) = env::var("APP_PRIVATE_KEY") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Self::try_from(trimmed).map_err(Into::into);
-            }
-        }
-
-        let secret_id = env::var("APP_PRIVATE_KEY_SECRET_NAME")
-            .or_else(|_| env::var("APP_PRIVATE_KEY_SECRET_ARN"))
-            .map_err(|_| AppError::AppPrivateKeyNotConfigured)?;
-        let response = secrets
-            .get_secret_value()
-            .secret_id(secret_id)
-            .send()
-            .await?;
-        let value = response
-            .secret_string()
-            .ok_or(AppError::AppPrivateKeyNotConfigured)?;
-
-        Self::try_from(value).map_err(Into::into)
+        Self::try_from(value.to_owned()).map_err(Into::into)
     }
 }
 
@@ -136,57 +202,89 @@ impl JtiTableName {
     }
 }
 
+impl TryFrom<String> for AppPrivateKey {
+    type Error = AppError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = value.replace("\\n", "\n").trim().to_string();
+        if value.is_empty() {
+            return Err(AppError::AppPrivateKeyNotConfigured);
+        }
+
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for AppPrivateKey {
+    type Error = AppError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.to_owned().try_into()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub policy: Policy,
     pub app_id: AppId,
     pub app_private_key: AppPrivateKey,
     pub jti_table_name: JtiTableName,
-    pub github_api_base: reqwest::Url,
+    pub github_api_base: GithubApiBase,
     pub dynamodb: DynamoDbClient,
     pub http_client: reqwest::Client,
     pub jwks_cache: Arc<JwksCache>,
 }
 
-pub async fn load() -> Result<Config, Error> {
-    let policy = Policy::from_env()?;
-    let shared_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let ssm = SsmClient::new(&shared_config);
-    let secrets = SecretsManagerClient::new(&shared_config);
-
-    let app_id = AppId::from_env_or_ssm(&ssm).await?;
-    let app_private_key = AppPrivateKey::from_env_or_secret(&secrets).await?;
-    let jti_table_name = JtiTableName::from_env()?;
-    let github_api_base = load_github_api_base()?;
-
-    let http_client = reqwest::Client::builder()
+pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
         .user_agent("ost-simple-sts")
-        .build()?;
-
-    let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
-
-    Ok(Config {
-        policy,
-        app_id,
-        app_private_key,
-        jti_table_name,
-        github_api_base,
-        dynamodb: DynamoDbClient::new(&shared_config),
-        http_client,
-        jwks_cache,
-    })
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
 }
 
-fn load_github_api_base() -> Result<reqwest::Url, Error> {
-    let github_api_url =
-        env::var("GITHUB_API_URL").unwrap_or_else(|_| DEFAULT_GITHUB_API_URL.to_string());
-    reqwest::Url::parse(&github_api_url).map_err(|_| AppError::InvalidGithubApiUrl.into())
+impl Config {
+    pub async fn load() -> Result<Self, Error> {
+        let policy = Policy::from_env()?;
+        let shared_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let ssm = SsmClient::new(&shared_config);
+        let secrets = SecretsManagerClient::new(&shared_config);
+
+        let app_id = match AppId::from_env() {
+            Ok(app_id) => app_id,
+            Err(AppError::AppIdNotConfigured) => AppId::from_ssm(&ssm).await?,
+            Err(error) => return Err(error.into()),
+        };
+
+        let app_private_key = match AppPrivateKey::from_env() {
+            Ok(app_private_key) => app_private_key,
+            Err(AppError::AppPrivateKeyNotConfigured) => {
+                AppPrivateKey::from_secrets_manager(&secrets).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let jti_table_name = JtiTableName::from_env()?;
+        let github_api_base = GithubApiBase::from_env()?;
+        let http_client = build_http_client()?;
+        let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
+
+        Ok(Self {
+            policy,
+            app_id,
+            app_private_key,
+            jti_table_name,
+            github_api_base,
+            dynamodb: DynamoDbClient::new(&shared_config),
+            http_client,
+            jwks_cache,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Policy;
-    use crate::types::EnvironmentName;
+    use super::{AppPrivateKey, GitRef, Policy, WorkflowPath};
     use serde_json::json;
 
     #[test]
@@ -205,24 +303,17 @@ mod tests {
             policy.allowed_workflow_path().as_str(),
             ".github/workflows/release.yml"
         );
-        assert_eq!(
-            policy.allowed_environment().map(EnvironmentName::as_str),
-            Some("release")
-        );
     }
 
     #[test]
-    fn policy_from_str_deserializes_into_validated_types() {
+    fn policy_from_str_works() {
         let policy: Policy = r#"{
             "expected_audience": "https://example.com",
             "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml",
-            "allowed_environment": "release"
+            "allowed_workflow_path": ".github/workflows/release.yml"
         }"#
         .parse()
         .unwrap();
-
-        assert_eq!(policy.expected_audience().as_str(), "https://example.com");
         assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
     }
 
@@ -233,21 +324,32 @@ mod tests {
             "allowed_ref": "refs/heads/main",
             "allowed_workflow_path": ".github/workflows/release.yml"
         }));
-
         assert!(result.is_err());
     }
 
     #[test]
     fn git_ref_rejects_non_canonical_refs() {
-        assert!(crate::types::GitRef::try_from("main").is_err());
-        assert!(crate::types::GitRef::try_from("refs/pull/1/head").is_err());
-        assert!(crate::types::GitRef::try_from("refs/heads/main").is_ok());
-        assert!(crate::types::GitRef::try_from("refs/tags/v1.2.3").is_ok());
+        assert!(GitRef::try_from("main").is_err());
+        assert!(GitRef::try_from("refs/pull/1/head").is_err());
+        assert!(GitRef::try_from("refs/heads/main").is_ok());
+        assert!(GitRef::try_from("refs/tags/v1.2.3").is_ok());
     }
 
     #[test]
     fn workflow_path_requires_github_workflows_prefix() {
-        assert!(crate::types::WorkflowPath::try_from("release.yml").is_err());
-        assert!(crate::types::WorkflowPath::try_from(".github/workflows/release.yml").is_ok());
+        assert!(WorkflowPath::try_from("release.yml").is_err());
+        assert!(WorkflowPath::try_from(".github/workflows/release.yml").is_ok());
+    }
+
+    #[test]
+    fn app_private_key_normalizes_escaped_newlines_and_whitespace() {
+        let key = AppPrivateKey::try_from("  line1\\nline2  ").unwrap();
+        assert_eq!(key.as_str(), "line1\nline2");
+    }
+
+    #[test]
+    fn app_private_key_debug_is_redacted() {
+        let key = AppPrivateKey::try_from("super-secret-private-key").unwrap();
+        assert_eq!(format!("{key:?}"), "AppPrivateKey(\"<redacted>\")");
     }
 }

@@ -10,6 +10,7 @@ const JWKS_TTL: Duration = Duration::from_secs(300);
 
 pub struct JwksCache {
     http_client: reqwest::Client,
+    jwks_url: String,
     inner: RwLock<Option<CachedJwks>>,
 }
 
@@ -22,6 +23,16 @@ impl JwksCache {
     pub fn new(http_client: reqwest::Client) -> Self {
         Self {
             http_client,
+            jwks_url: ACTIONS_JWKS_URL.to_string(),
+            inner: RwLock::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_url(http_client: reqwest::Client, jwks_url: String) -> Self {
+        Self {
+            http_client,
+            jwks_url,
             inner: RwLock::new(None),
         }
     }
@@ -48,7 +59,7 @@ impl JwksCache {
     async fn refresh(&self) -> Result<JwkSet, AppError> {
         let response = self
             .http_client
-            .get(ACTIONS_JWKS_URL)
+            .get(&self.jwks_url)
             .send()
             .await
             .map_err(|error| {
@@ -82,5 +93,104 @@ impl JwksCache {
             .find(|jwk| jwk.common.key_id.as_deref() == Some(kid))?;
 
         DecodingKey::from_jwk(jwk).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JwksCache;
+    use crate::error::AppError;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rsa::traits::PublicKeyParts;
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder().build().unwrap()
+    }
+
+    fn jwks_body(kid: &str) -> serde_json::Value {
+        let mut rng = rand::thread_rng();
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = private_key.to_public_key();
+        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+
+        json!({
+            "keys": [{
+                "kty": "RSA",
+                "n": n,
+                "e": e,
+                "kid": kid,
+                "alg": "RS256",
+                "use": "sig"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn decoding_key_for_uses_cached_jwks() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body("kid-1")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new_with_url(
+            test_http_client(),
+            format!("{}/.well-known/jwks", server.uri()),
+        );
+
+        cache.decoding_key_for("kid-1").await.unwrap();
+        cache.decoding_key_for("kid-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoding_key_for_returns_invalid_oidc_token_for_unknown_kid() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body("known-kid")))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new_with_url(
+            test_http_client(),
+            format!("{}/.well-known/jwks", server.uri()),
+        );
+
+        let error = cache
+            .decoding_key_for("missing-kid")
+            .await
+            .err()
+            .expect("expected missing kid to fail");
+        assert!(matches!(error, AppError::InvalidOidcToken));
+    }
+
+    #[tokio::test]
+    async fn decoding_key_for_maps_http_failure_to_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let cache = JwksCache::new_with_url(
+            test_http_client(),
+            format!("{}/.well-known/jwks", server.uri()),
+        );
+
+        let error = cache
+            .decoding_key_for("any-kid")
+            .await
+            .err()
+            .expect("expected jwks fetch to fail");
+        assert!(matches!(error, AppError::OidcVerificationUnavailable));
     }
 }

@@ -1,0 +1,6 @@
+{
+  "expected_audience": "https://8q9ky24nn4.execute-api.us-east-2.amazonaws.com",
+  "allowed_ref": "refs/heads/main",
+  "allowed_workflow_path": ".github/workflows/release.yml",
+  "allowed_environment": "release"
+}

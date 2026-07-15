@@ -1,30 +1,23 @@
 use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validation};
-use lambda_http::{http::header::AUTHORIZATION, Body, Error, Request, RequestExt, Response};
+use lambda_http::{http::header::AUTHORIZATION, Request, RequestExt};
 use serde::Deserialize;
 use serde_json::json;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
-    config::Config,
+    config::{Config, GitRef},
     error::AppError,
-    github, http, replay,
-    types::{ExpiresInMinutes, GitRef, Jti, RepositoryFullName, RepositoryId},
+    github::{self, ExpiresInMinutes, Jti, RepositoryFullName, RepositoryId},
+    replay,
 };
 
 const ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const CLOCK_TOLERANCE_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum StringOrNumber {
-    String(String),
-    Number(u64),
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct GitHubActionsClaims {
     repository: Option<String>,
-    repository_id: Option<StringOrNumber>,
+    repository_id: Option<RepositoryId>,
     #[serde(rename = "ref")]
     git_ref: Option<String>,
     event_name: Option<String>,
@@ -44,54 +37,32 @@ struct VerifiedClaims {
     expires_at_ms: u64,
 }
 
-impl TryFrom<StringOrNumber> for RepositoryId {
-    type Error = AppError;
-
-    fn try_from(value: StringOrNumber) -> Result<Self, Self::Error> {
-        match value {
-            StringOrNumber::String(value) => value
-                .parse::<u64>()
-                .map_err(|_| AppError::RepositoryIdClaimInvalid)
-                .and_then(RepositoryId::try_from),
-            StringOrNumber::Number(value) => RepositoryId::try_from(value),
-        }
-    }
+pub struct ExchangeResult {
+    pub token: github::Token,
+    pub expires_at: String,
+    pub repository: String,
+    pub git_ref: String,
 }
 
-pub async fn handle(config: Config, request: Request) -> Result<Response<Body>, Error> {
-    let expires_in = match request
+pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, AppError> {
+    let expires_in = request
         .query_string_parameters()
         .first("expires_in")
         .map(ExpiresInMinutes::try_from)
-        .transpose()
-    {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
-    };
+        .transpose()?;
 
-    let claims = match verify_oidc_claims(&config, &request).await {
-        Ok(claims) => claims,
-        Err(error) => return error.into_response(),
-    };
+    let claims = verify_oidc_claims(&config, &request).await?;
 
-    if let Err(error) = replay::claim_jti(
+    replay::claim_jti(
         &config.dynamodb,
         &config.jti_table_name,
         ACTIONS_ISSUER,
         &claims.jti,
         claims.expires_at_ms,
     )
-    .await
-    {
-        return error.into_response();
-    }
+    .await?;
 
-    let response = match mint_installation_token(&config, &claims, expires_in).await {
-        Ok(response) => response,
-        Err(error) => return error.into_response(),
-    };
-
-    http::json(200, &response)
+    mint_installation_token(&config, &claims, expires_in).await
 }
 
 async fn verify_oidc_claims(
@@ -151,8 +122,7 @@ async fn verify_oidc_claims(
 
     let repository_id = claims
         .repository_id
-        .ok_or(AppError::RepositoryIdClaimInvalid)
-        .and_then(RepositoryId::try_from)?;
+        .ok_or(AppError::RepositoryIdClaimInvalid)?;
     let jti = claims
         .jti
         .ok_or(AppError::OidcTokenMissingJti)
@@ -172,7 +142,7 @@ async fn mint_installation_token(
     config: &Config,
     claims: &VerifiedClaims,
     expires_in_minutes: Option<ExpiresInMinutes>,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<ExchangeResult, AppError> {
     let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
     let installation_id = github::find_installation(
         &config.http_client,
@@ -192,18 +162,18 @@ async fn mint_installation_token(
         &config.github_api_base,
         &app_jwt,
         installation_id,
-        &[claims.repository_id.get()],
+        &[*claims.repository_id],
         json!({ "contents": "write" }),
         expires_at.as_deref(),
     )
     .await?;
 
-    Ok(json!({
-        "token": token.token,
-        "expires_at": token.expires_at,
-        "repository": claims.repository.as_str(),
-        "ref": claims.git_ref.as_str(),
-    }))
+    Ok(ExchangeResult {
+        token: token.token,
+        expires_at: token.expires_at,
+        repository: claims.repository.as_str().to_string(),
+        git_ref: claims.git_ref.as_str().to_string(),
+    })
 }
 
 fn get_bearer_token(request: &Request) -> Option<&str> {
@@ -251,8 +221,9 @@ fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::StringOrNumber;
-    use crate::types::{ExpiresInMinutes, RepositoryFullName, RepositoryId};
+    use super::get_bearer_token;
+    use crate::github::{ExpiresInMinutes, RepositoryFullName, RepositoryId};
+    use lambda_http::{http::Request, Body};
 
     #[test]
     fn repository_full_name_accepts_owner_and_repo() {
@@ -270,25 +241,15 @@ mod tests {
     }
 
     #[test]
-    fn repository_id_accepts_strings_and_numbers() {
-        assert_eq!(
-            RepositoryId::try_from(StringOrNumber::String("42".to_string()))
-                .unwrap()
-                .get(),
-            42
-        );
-        assert_eq!(
-            RepositoryId::try_from(StringOrNumber::Number(7))
-                .unwrap()
-                .get(),
-            7
-        );
+    fn repository_id_deserializes_from_strings_and_numbers() {
+        assert_eq!(*serde_json::from_str::<RepositoryId>("42").unwrap(), 42);
+        assert_eq!(*serde_json::from_str::<RepositoryId>(r#""7""#).unwrap(), 7);
     }
 
     #[test]
     fn repository_id_rejects_invalid_values() {
-        assert!(RepositoryId::try_from(StringOrNumber::String("zero".to_string())).is_err());
-        assert!(RepositoryId::try_from(StringOrNumber::Number(0)).is_err());
+        assert!(serde_json::from_str::<RepositoryId>(r#""zero""#).is_err());
+        assert!(serde_json::from_str::<RepositoryId>("0").is_err());
     }
 
     #[test]
@@ -302,5 +263,330 @@ mod tests {
         assert!(ExpiresInMinutes::try_from("9").is_err());
         assert!(ExpiresInMinutes::try_from("61").is_err());
         assert!(ExpiresInMinutes::try_from("abc").is_err());
+    }
+
+    #[test]
+    fn get_bearer_token_extracts_token() {
+        let request = Request::builder()
+            .header("authorization", "Bearer my-token")
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), Some("my-token"));
+    }
+
+    #[test]
+    fn get_bearer_token_is_case_insensitive() {
+        let request = Request::builder()
+            .header("authorization", "bearer my-token")
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), Some("my-token"));
+    }
+
+    #[test]
+    fn get_bearer_token_rejects_missing_header() {
+        let request = Request::builder().body(Body::Empty).unwrap();
+        assert_eq!(get_bearer_token(&request), None);
+    }
+
+    #[test]
+    fn get_bearer_token_rejects_wrong_scheme() {
+        let request = Request::builder()
+            .header("authorization", "Basic abc123")
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), None);
+    }
+
+    #[test]
+    fn get_bearer_token_rejects_empty_token() {
+        let request = Request::builder()
+            .header("authorization", "Bearer ")
+            .body(Body::Empty)
+            .unwrap();
+        assert_eq!(get_bearer_token(&request), None);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::{
+        config::{Config, Policy},
+        error::AppError,
+        github::GithubApiBase,
+        jwks::JwksCache,
+    };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use lambda_http::{http::Request, Body};
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::traits::PublicKeyParts;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    struct TestFixture {
+        server: MockServer,
+        encoding_key: EncodingKey,
+        kid: String,
+    }
+
+    impl TestFixture {
+        async fn new() -> Self {
+            let server = MockServer::start().await;
+
+            let mut rng = rand::thread_rng();
+            let private_key =
+                rsa::RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate RSA key");
+            let pem = private_key
+                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("failed to encode private key");
+
+            let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+            let public_key = private_key.to_public_key();
+            let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
+            let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+
+            let kid = "test-kid-001".to_string();
+
+            let jwks_response = json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "n": n,
+                    "e": e,
+                    "kid": kid,
+                    "alg": "RS256",
+                    "use": "sig",
+                }]
+            });
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/jwks"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(jwks_response))
+                .mount(&server)
+                .await;
+
+            Self {
+                server,
+                encoding_key,
+                kid,
+            }
+        }
+
+        fn now_secs(&self) -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        fn sign_claims(&self, claims: serde_json::Value) -> String {
+            let mut header = Header::new(Algorithm::RS256);
+            header.kid = Some(self.kid.clone());
+            encode(&header, &claims, &self.encoding_key).unwrap()
+        }
+
+        fn base_url(&self) -> GithubApiBase {
+            GithubApiBase::try_from(self.server.uri().as_str()).unwrap()
+        }
+
+        fn policy(&self) -> Policy {
+            serde_json::from_value(json!({
+                "expected_audience": self.server.uri(),
+                "allowed_ref": "refs/heads/main",
+                "allowed_workflow_path": ".github/workflows/release.yml",
+                "allowed_environment": "release"
+            }))
+            .unwrap()
+        }
+
+        fn valid_claims(&self) -> serde_json::Value {
+            let now = self.now_secs();
+            json!({
+                "iss": ACTIONS_ISSUER,
+                "aud": self.server.uri(),
+                "iat": now - 10,
+                "nbf": now - 10,
+                "exp": now + 300,
+                "jti": format!("test-jti-{now}"),
+                "ref": "refs/heads/main",
+                "repository": "octo/tools",
+                "repository_id": "42",
+                "event_name": "workflow_dispatch",
+                "workflow_ref": format!("octo/tools/.github/workflows/release.yml@refs/heads/main"),
+                "environment": "release",
+            })
+        }
+
+        fn make_request(&self, token: &str) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::Empty)
+                .unwrap()
+        }
+
+        fn build_config(&self, policy: Policy) -> Config {
+            let http_client = reqwest::Client::builder().build().unwrap();
+            let jwks_url = format!("{}/.well-known/jwks", self.server.uri());
+            let jwks_cache = Arc::new(JwksCache::new_with_url(http_client.clone(), jwks_url));
+
+            Config {
+                policy,
+                app_id: "test-app-id".try_into().unwrap(),
+                app_private_key: "test-key-not-used".try_into().unwrap(),
+                jti_table_name: "test-table".try_into().unwrap(),
+                github_api_base: self.base_url(),
+                dynamodb: aws_sdk_dynamodb::Client::from_conf(
+                    aws_sdk_dynamodb::Config::builder()
+                        .behavior_version(aws_config::BehaviorVersion::latest())
+                        .region(aws_config::Region::new("us-east-1"))
+                        .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                            "test", "test", None, None, "test",
+                        ))
+                        .build(),
+                ),
+                http_client,
+                jwks_cache,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_valid_token() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let claims = fixture.valid_claims();
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+        assert_eq!(verified.repository.as_str(), "octo/tools");
+        assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_job_workflow_ref() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["workflow_ref"] = serde_json::Value::Null;
+        claims["job_workflow_ref"] =
+            json!("octo/tools/.github/workflows/release.yml@refs/heads/main");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+        assert_eq!(verified.repository.as_str(), "octo/tools");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_missing_repository_claim() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["repository"] = serde_json::Value::Null;
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::RepositoryClaimMissing));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_ref() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["ref"] = json!("refs/heads/develop");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::RefNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_environment() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["environment"] = json!("staging");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::EnvironmentNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_event() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["event_name"] = json!("push");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::EventNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_wrong_workflow() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["workflow_ref"] = json!("octo/tools/.github/workflows/ci.yml@refs/heads/main");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::WorkflowNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_expired_token() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        let past = fixture.now_secs() - 600;
+        claims["iat"] = json!(past - 10);
+        claims["exp"] = json!(past);
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::OidcTokenExpired));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_missing_bearer() {
+        let fixture = TestFixture::new().await;
+        let policy = fixture.policy();
+        let config = fixture.build_config(policy);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/exchange")
+            .body(Body::Empty)
+            .unwrap();
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::MissingBearerToken));
     }
 }

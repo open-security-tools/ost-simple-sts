@@ -74,9 +74,12 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref JtiTable
-        - SSMParameterReadPolicy:
-            ParameterName: !Ref AppIdParameterName
         - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AppIdParameterName}
             - Effect: Allow
               Action:
                 - secretsmanager:GetSecretValue

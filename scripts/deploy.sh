@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+#
+# Build and deploy the ost-simple-sts SAM stack.
+#
+# Usage:
+#   ./scripts/deploy.sh              # uses .env in project root
+#   ENV_FILE=/path/to/.env ./scripts/deploy.sh
+#
+# Required .env variables:
+#   STACK_NAME                  CloudFormation stack name
+#   POLICY_FILE                 Path to the policy JSON file
+#   APP_ID_PARAMETER            SSM parameter name for App ID
+#   APP_PRIVATE_KEY_SECRET_NAME Secrets Manager secret name
+#   JTI_TABLE_NAME              DynamoDB table name for JTI replay guard
+#
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,14 +46,11 @@ set -a
 source "$ENV_FILE"
 set +a
 
-POLICY_FILE="${POLICY_FILE:-$ROOT_DIR/policy.json}"
-APP_ID_PARAMETER="${APP_ID_PARAMETER:-/ost/app-id}"
-APP_PRIVATE_KEY_SECRET_NAME="${APP_PRIVATE_KEY_SECRET_NAME:-}"
-JTI_TABLE_NAME="${JTI_TABLE_NAME:-ost-jti-replay}"
-STACK_NAME="${STACK_NAME:-ost-simple-sts}"
-
+require_var STACK_NAME
 require_var POLICY_FILE
+require_var APP_ID_PARAMETER
 require_var APP_PRIVATE_KEY_SECRET_NAME
+require_var JTI_TABLE_NAME
 
 if [[ ! -f "$POLICY_FILE" ]]; then
   echo "policy file not found: $POLICY_FILE" >&2
@@ -48,15 +59,21 @@ fi
 
 cd "$ROOT_DIR"
 
-sam_args=(
-  deploy
-  --beta-features
-  --stack-name "$STACK_NAME"
-  --parameter-overrides
-  "PolicyJson=$(jq -c . "$POLICY_FILE")"
-  "AppPrivateKeySecretName=$APP_PRIVATE_KEY_SECRET_NAME"
-  "AppIdParameterName=$APP_ID_PARAMETER"
-  "JtiTableName=$JTI_TABLE_NAME"
-)
+POLICY_JSON=$(jq -c . "$POLICY_FILE")
+BUILD_TEMPLATE_FILE=".aws-sam/build/template.yaml"
 
-sam "${sam_args[@]}" "$@"
+sam build --beta-features --no-use-container
+
+sam deploy \
+  --beta-features \
+  --template-file "$BUILD_TEMPLATE_FILE" \
+  --resolve-s3 \
+  --capabilities CAPABILITY_IAM \
+  --stack-name "$STACK_NAME" \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+    "ParameterKey=PolicyJson,ParameterValue='$POLICY_JSON'" \
+    "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
+    "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
+    "ParameterKey=JtiTableName,ParameterValue=$JTI_TABLE_NAME" \
+  "$@"
