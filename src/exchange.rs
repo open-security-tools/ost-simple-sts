@@ -141,7 +141,10 @@ async fn verify_oidc_claims(
         config.policy.allowed_ref(),
     );
     if claims.workflow_ref.as_deref() != Some(expected_workflow_ref.as_str())
-        && claims.job_workflow_ref.as_deref() != Some(expected_workflow_ref.as_str())
+        || claims
+            .job_workflow_ref
+            .as_deref()
+            .is_some_and(|workflow_ref| workflow_ref != expected_workflow_ref)
     {
         return Err(AppError::WorkflowNotAllowed);
     }
@@ -497,12 +500,11 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn verify_oidc_claims_accepts_job_workflow_ref() {
+    async fn verify_oidc_claims_accepts_matching_job_workflow_ref() {
         let fixture = TestFixture::new().await;
         let policy = fixture.policy();
         let config = fixture.build_config(policy);
         let mut claims = fixture.valid_claims();
-        claims["workflow_ref"] = serde_json::Value::Null;
         claims["job_workflow_ref"] =
             json!("octo/tools/.github/workflows/release.yml@refs/heads/main");
         let token = fixture.sign_claims(claims);
@@ -510,6 +512,35 @@ mod integration_tests {
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
         assert_eq!(verified.repository.as_str(), "octo/tools");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_missing_caller_workflow_ref() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["workflow_ref"] = serde_json::Value::Null;
+        claims["job_workflow_ref"] =
+            json!("octo/tools/.github/workflows/release.yml@refs/heads/main");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::WorkflowNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_mismatched_job_workflow_ref() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let mut claims = fixture.valid_claims();
+        claims["job_workflow_ref"] =
+            json!("octo/untrusted/.github/workflows/release.yml@refs/heads/main");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_request(&token);
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert!(matches!(error, AppError::WorkflowNotAllowed));
     }
 
     #[tokio::test]

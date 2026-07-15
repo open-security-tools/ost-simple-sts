@@ -80,6 +80,10 @@ shown above; repositories using the previous format would use
 `repo:example-org/example-repo:environment:release` instead. Keep the environment's deployment
 rules restricted to the intended ref.
 
+The caller's `workflow_ref` must match the configured workflow path and ref. If the job runs in a
+reusable workflow, its `job_workflow_ref` must match too; a trusted caller cannot delegate token
+minting to a different reusable workflow.
+
 ## Exchange
 
 The broker exposes two routes:
