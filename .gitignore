@@ -3,3 +3,4 @@ target/
 .env
 .env.local
 .secrets/
+/policy.json
