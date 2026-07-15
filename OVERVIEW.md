@@ -1,62 +1,35 @@
-┌──────────────────────────────────────────────────────────────────────┐
-│                             ost-simple-sts                           │
-└──────────────────────────────────────────────────────────────────────┘
+# Architecture
 
-                                 HTTP / Lambda
-                                       │
-                                       ▼
-                              ┌────────────────┐
-                              │   src/main.rs  │
-                              │----------------│
-                              │ route request  │
-                              │ map response   │
-                              └───────┬────────┘
-                                      │
-                                      ▼
-                            ┌────────────────────┐
-                            │ src/exchange.rs    │
-                            │--------------------│
-                            │ verify OIDC claims │
-                            │ replay guard       │
-                            │ mint app token     │
-                            └───────┬────────────┘
-                                    │
-            ┌───────────────────────┼──────────────────────────────┐
-            ▼                       ▼                              ▼
- ┌──────────────────┐   ┌──────────────────────┐      ┌─────────────────────┐
- │ src/jwks.rs      │   │ src/replay.rs        │      │ src/github.rs       │
- │------------------│   │----------------------│      │---------------------│
- │ JWKS cache + TTL │   │ DynamoDB jti claim   │      │ app jwt auth        │
- │ kid -> key       │   │ conditional put_item │      │ installation lookup │
- │ OIDC key fetch   │   │ replay detection     │      │ token minting       │
- └─────────┬────────┘   └──────────┬───────────┘      └───────────┬─────────┘
-           │                       │                               │
-           ▼                       ▼                               ▼
-  ┌──────────────────┐   ┌──────────────────┐           ┌──────────────────┐
-  │ src/config.rs    │   │ src/error.rs     │           │ src/response.rs  │
-  │------------------│   │------------------│           │------------------│
-  │ validated policy │   │ stable error code│           │ JSON success/err │
-  │ app id / key     │   │ + HTTP status    │           │ no-store headers │
-  │ api base / client│   └──────────────────┘           └──────────────────┘
-  └──────────────────┘
+```text
+HTTP / Lambda
+  └── src/main.rs              route requests and map responses
+      └── src/exchange.rs      verify OIDC claims, prevent replay, and mint a token
+          ├── src/jwks.rs      cache GitHub Actions signing keys
+          ├── src/replay.rs    conditionally claim the OIDC jti in DynamoDB
+          └── src/github/
+              ├── api.rs       validated API base, headers, and bounded GET retries
+              ├── repositories.rs
+              │                validated repository and jti types
+              └── tokens.rs    App JWT, installation lookup, and token creation
 
+src/config.rs                  validated policy and runtime configuration
+src/error.rs                   stable error codes and HTTP status mapping
+src/response.rs                no-store JSON responses and token redaction
+```
 
-Data flow summary
-=================
+## Data flow
 
-1. `/exchange` receives GitHub Actions OIDC JWT
-2. JWT is validated against Actions JWKS + policy constraints
-3. `jti` is claimed in DynamoDB to prevent replay
-4. GitHub App JWT is minted from configured app id/private key
-5. App installation is resolved for repository
-6. Installation token is minted and returned to caller
+1. `/exchange` receives a GitHub Actions OIDC JWT.
+1. The JWT is validated against the Actions JWKS and configured policy.
+1. The `jti` is claimed in DynamoDB to prevent replay.
+1. A GitHub App JWT is minted from the configured App ID and private key.
+1. The repository installation is resolved.
+1. A repository-scoped installation token is minted and returned to the caller.
 
+## Validated domain types
 
-Key validated domain types
-==========================
-
-- `Policy`, `Audience`, `GitRef`, `WorkflowPath`, `EnvironmentName`
+- `Policy`, `Audience`, `Subject`, `GitRef`, `WorkflowPath`, `EnvironmentName`
 - `RepositoryFullName`, `RepositoryOwner`, `RepositoryNamePart`, `RepositoryId`
-- `GithubApiBase`, `JtiTableName`, `Jti`
+- `GithubApiBase`, `JtiTableName`, `Jti`, `Token`
 
-These types reduce stringly-typed checks across the request path.
+These types keep validation and redaction close to the request boundary.
