@@ -21,25 +21,37 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 #[serde(try_from = "RawPolicy")]
 pub struct Policy {
     expected_audience: Audience,
-    allowed_subject: Subject,
-    allowed_repository: RepositoryFullName,
-    allowed_repository_id: RepositoryId,
-    allowed_ref: GitRef,
-    allowed_workflow_path: WorkflowPath,
-    allowed_environment: Option<EnvironmentName>,
+    rules: Vec<PolicyRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolicyRule {
+    subject: Subject,
+    repository: RepositoryFullName,
+    repository_id: RepositoryId,
+    git_ref: GitRef,
+    workflow_path: WorkflowPath,
+    environment: Option<EnvironmentName>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
     expected_audience: String,
-    allowed_subject: String,
-    allowed_repository: String,
-    allowed_repository_id: RepositoryId,
-    allowed_ref: String,
-    allowed_workflow_path: String,
+    rules: Vec<RawPolicyRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyRule {
+    subject: String,
+    repository: String,
+    repository_id: RepositoryId,
+    #[serde(rename = "ref")]
+    git_ref: String,
+    workflow_path: String,
     #[serde(default)]
-    allowed_environment: Option<String>,
+    environment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,33 +157,39 @@ impl Policy {
         &self.expected_audience
     }
 
-    pub fn allowed_subject(&self) -> &Subject {
-        &self.allowed_subject
-    }
-
-    pub fn allowed_repository(&self) -> &RepositoryFullName {
-        &self.allowed_repository
-    }
-
-    pub fn allowed_repository_id(&self) -> RepositoryId {
-        self.allowed_repository_id
-    }
-
-    pub fn allowed_ref(&self) -> &GitRef {
-        &self.allowed_ref
-    }
-
-    pub fn allowed_workflow_path(&self) -> &WorkflowPath {
-        &self.allowed_workflow_path
-    }
-
-    pub fn allowed_environment(&self) -> Option<&EnvironmentName> {
-        self.allowed_environment.as_ref()
+    pub fn rules(&self) -> &[PolicyRule] {
+        &self.rules
     }
 
     pub fn from_env() -> Result<Self, AppError> {
         let policy_json = env::var("POLICY_JSON").map_err(|_| AppError::PolicyNotConfigured)?;
         policy_json.parse()
+    }
+}
+
+impl PolicyRule {
+    pub fn subject(&self) -> &Subject {
+        &self.subject
+    }
+
+    pub fn repository(&self) -> &RepositoryFullName {
+        &self.repository
+    }
+
+    pub fn repository_id(&self) -> RepositoryId {
+        self.repository_id
+    }
+
+    pub fn git_ref(&self) -> &GitRef {
+        &self.git_ref
+    }
+
+    pub fn workflow_path(&self) -> &WorkflowPath {
+        &self.workflow_path
+    }
+
+    pub fn environment(&self) -> Option<&EnvironmentName> {
+        self.environment.as_ref()
     }
 }
 
@@ -187,17 +205,36 @@ impl TryFrom<RawPolicy> for Policy {
     type Error = AppError;
 
     fn try_from(raw: RawPolicy) -> Result<Self, Self::Error> {
+        let rules = raw
+            .rules
+            .into_iter()
+            .map(PolicyRule::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if rules.is_empty() {
+            return Err(AppError::InvalidPolicy);
+        }
+
         Ok(Self {
             expected_audience: raw.expected_audience.try_into()?,
-            allowed_subject: raw.allowed_subject.try_into()?,
-            allowed_repository: raw
-                .allowed_repository
+            rules,
+        })
+    }
+}
+
+impl TryFrom<RawPolicyRule> for PolicyRule {
+    type Error = AppError;
+
+    fn try_from(raw: RawPolicyRule) -> Result<Self, Self::Error> {
+        Ok(Self {
+            subject: raw.subject.try_into()?,
+            repository: raw
+                .repository
                 .try_into()
                 .map_err(|_| AppError::InvalidPolicy)?,
-            allowed_repository_id: raw.allowed_repository_id,
-            allowed_ref: raw.allowed_ref.try_into()?,
-            allowed_workflow_path: raw.allowed_workflow_path.try_into()?,
-            allowed_environment: raw.allowed_environment.map(TryInto::try_into).transpose()?,
+            repository_id: raw.repository_id,
+            git_ref: raw.git_ref.try_into()?,
+            workflow_path: raw.workflow_path.try_into()?,
+            environment: raw.environment.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -324,53 +361,79 @@ mod tests {
     fn policy_deserializes_into_validated_types() {
         let policy: Policy = serde_json::from_value(json!({
             "expected_audience": "https://example.com",
-            "allowed_subject": "repo:octo/tools:environment:release",
-            "allowed_repository": "octo/tools",
-            "allowed_repository_id": 42,
-            "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml",
-            "allowed_environment": "release"
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release"
+            }, {
+                "subject": "repo:octo/docs:ref:refs/tags/v1",
+                "repository": "octo/docs",
+                "repository_id": 43,
+                "ref": "refs/tags/v1",
+                "workflow_path": ".github/workflows/publish.yml"
+            }]
         }))
         .unwrap();
 
         assert_eq!(policy.expected_audience().as_str(), "https://example.com");
+        assert_eq!(policy.rules().len(), 2);
+        let rule = &policy.rules()[0];
         assert_eq!(
-            policy.allowed_subject().as_str(),
+            rule.subject().as_str(),
             "repo:octo/tools:environment:release"
         );
-        assert_eq!(policy.allowed_repository().as_str(), "octo/tools");
-        assert_eq!(*policy.allowed_repository_id(), 42);
-        assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
+        assert_eq!(rule.repository().as_str(), "octo/tools");
+        assert_eq!(*rule.repository_id(), 42);
+        assert_eq!(rule.git_ref().as_str(), "refs/heads/main");
         assert_eq!(
-            policy.allowed_workflow_path().as_str(),
+            rule.workflow_path().as_str(),
             ".github/workflows/release.yml"
         );
+        assert_eq!(rule.environment().unwrap().as_str(), "release");
+        assert_eq!(policy.rules()[1].repository().as_str(), "octo/docs");
+        assert!(policy.rules()[1].environment().is_none());
     }
 
     #[test]
     fn policy_from_str_works() {
         let policy: Policy = r#"{
             "expected_audience": "https://example.com",
-            "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
-            "allowed_repository": "octo/tools",
-            "allowed_repository_id": "42",
-            "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml"
+            "rules": [{
+                "subject": "repo:octo/tools:ref:refs/heads/main",
+                "repository": "octo/tools",
+                "repository_id": "42",
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml"
+            }]
         }"#
         .parse()
         .unwrap();
-        assert_eq!(policy.allowed_ref().as_str(), "refs/heads/main");
+        assert_eq!(policy.rules()[0].git_ref().as_str(), "refs/heads/main");
     }
 
     #[test]
     fn policy_rejects_empty_strings() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "expected_audience": "",
-            "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
-            "allowed_repository": "octo/tools",
-            "allowed_repository_id": 42,
-            "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml"
+            "rules": [{
+                "subject": "repo:octo/tools:ref:refs/heads/main",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml"
+            }]
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_rejects_empty_rules() {
+        let result: Result<Policy, _> = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": []
         }));
         assert!(result.is_err());
     }
@@ -379,12 +442,14 @@ mod tests {
     fn policy_rejects_unknown_fields() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "expected_audience": "https://example.com",
-            "allowed_subject": "repo:octo/tools:environment:release",
-            "allowed_repository": "octo/tools",
-            "allowed_repository_id": 42,
-            "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml",
-            "allowed_enviroment": "release"
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "enviroment": "release"
+            }]
         }));
 
         assert!(result.is_err());
@@ -395,11 +460,13 @@ mod tests {
         for (repository, repository_id) in [("octo", 42), ("octo/tools", 0)] {
             let result: Result<Policy, _> = serde_json::from_value(json!({
                 "expected_audience": "https://example.com",
-                "allowed_subject": "repo:octo/tools:ref:refs/heads/main",
-                "allowed_repository": repository,
-                "allowed_repository_id": repository_id,
-                "allowed_ref": "refs/heads/main",
-                "allowed_workflow_path": ".github/workflows/release.yml"
+                "rules": [{
+                    "subject": "repo:octo/tools:ref:refs/heads/main",
+                    "repository": repository,
+                    "repository_id": repository_id,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml"
+                }]
             }));
 
             assert!(result.is_err());

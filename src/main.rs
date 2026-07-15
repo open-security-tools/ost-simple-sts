@@ -111,12 +111,14 @@ mod integration_tests {
     fn test_config() -> config::Config {
         let policy: config::Policy = serde_json::from_value(json!({
             "expected_audience": "https://example.com",
-            "allowed_subject": "repo:octo/tools:environment:release",
-            "allowed_repository": "octo/tools",
-            "allowed_repository_id": 42,
-            "allowed_ref": "refs/heads/main",
-            "allowed_workflow_path": ".github/workflows/release.yml",
-            "allowed_environment": "release"
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release"
+            }]
         }))
         .unwrap();
 

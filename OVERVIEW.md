@@ -28,7 +28,7 @@ src/response.rs                no-store JSON responses and token redaction
 
 ## Validated domain types
 
-- `Policy`, `Audience`, `Subject`, `GitRef`, `WorkflowPath`, `EnvironmentName`
+- `Policy`, `PolicyRule`, `Audience`, `Subject`, `GitRef`, `WorkflowPath`, `EnvironmentName`
 - `RepositoryFullName`, `RepositoryOwner`, `RepositoryNamePart`, `RepositoryId`
 - `GithubApiBase`, `JtiTableName`, `Jti`, `Token`
 
