@@ -34,10 +34,7 @@ runs:
       run: |
         set -euo pipefail
 
-        if [[ "$EXCHANGE_URL" != https://* ]]; then
-          echo "exchange-url must use HTTPS" >&2
-          exit 1
-        fi
+        node "$GITHUB_ACTION_PATH/scripts/validate-exchange-url.js" "$EXCHANGE_URL" "$OIDC_AUDIENCE"
 
         if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
           echo "id-token: write is required to request a GitHub OIDC token" >&2
