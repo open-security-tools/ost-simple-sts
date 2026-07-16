@@ -310,6 +310,8 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .user_agent("ost-simple-sts")
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
@@ -354,7 +356,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppPrivateKey, GitRef, Policy, WorkflowPath};
+    use super::{build_http_client, AppPrivateKey, GitRef, Policy, WorkflowPath};
     use serde_json::json;
 
     #[test]
@@ -497,5 +499,17 @@ mod tests {
     fn app_private_key_debug_is_redacted() {
         let key = AppPrivateKey::try_from("super-secret-private-key").unwrap();
         assert_eq!(format!("{key:?}"), "AppPrivateKey(\"<redacted>\")");
+    }
+
+    #[tokio::test]
+    async fn http_client_rejects_insecure_urls() {
+        let client = build_http_client().unwrap();
+        let error = client
+            .get("http://127.0.0.1:1/github-api")
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_builder());
     }
 }
