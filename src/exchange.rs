@@ -118,7 +118,7 @@ async fn verify_oidc_claims(
     }
 
     let git_ref = claims.git_ref.ok_or(AppError::RefNotAllowed)?;
-    rules.retain(|rule| git_ref == rule.git_ref().as_str());
+    rules.retain(|rule| rule.git_ref().matches(&git_ref));
     if rules.is_empty() {
         return Err(AppError::RefNotAllowed);
     }
@@ -163,13 +163,24 @@ async fn verify_oidc_claims(
             "{}/{workflow_path}@{git_ref}",
             rule.repository(),
             workflow_path = rule.workflow_path(),
-            git_ref = rule.git_ref(),
         );
-        claims.workflow_ref.as_deref() == Some(expected_workflow_ref.as_str())
-            && claims
-                .job_workflow_ref
-                .as_deref()
-                .is_none_or(|workflow_ref| workflow_ref == expected_workflow_ref)
+        if claims.workflow_ref.as_deref() != Some(expected_workflow_ref.as_str()) {
+            return false;
+        }
+
+        rule.job_workflow_path().map_or_else(
+            || {
+                claims
+                    .job_workflow_ref
+                    .as_deref()
+                    .is_none_or(|workflow_ref| workflow_ref == expected_workflow_ref)
+            },
+            |workflow_path| {
+                let expected_job_workflow_ref =
+                    format!("{}/{workflow_path}@{git_ref}", rule.repository());
+                claims.job_workflow_ref.as_deref() == Some(expected_job_workflow_ref.as_str())
+            },
+        )
     });
     let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
 
@@ -203,7 +214,7 @@ async fn verify_oidc_claims(
             || rule.permissions().clone(),
             |request| request.permissions.clone(),
         ),
-        git_ref: rule.git_ref().clone(),
+        git_ref: GitRef::try_from(git_ref).map_err(|_| AppError::RefNotAllowed)?,
         jti,
         expires_at_ms: exp.saturating_mul(1000) + CLOCK_TOLERANCE_SECONDS.saturating_mul(1000),
     })
@@ -993,6 +1004,213 @@ mod integration_tests {
             let error = verify_oidc_claims(&config, &request).await.unwrap_err();
             assert_eq!(error.code(), "invalid_exchange_request");
         }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_the_uv_security_review_publisher_rule() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/ci.yml",
+                "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "pull_requests": "write" },
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+        claims["repository"] = json!("astral-sh/uv");
+        claims["repository_id"] = json!(699532645);
+        claims["ref"] = json!("refs/pull/20474/merge");
+        claims["event_name"] = json!("pull_request");
+        claims["workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/ci.yml@refs/pull/20474/merge");
+        claims["job_workflow_ref"] = json!(
+            "astral-sh/uv/.github/workflows/pull-request-security-review.yml@refs/pull/20474/merge"
+        );
+        claims["environment"] = json!("automations");
+        let token = fixture.sign_claims(claims);
+        let request = fixture.make_scoped_request(
+            &token,
+            "astral-sh/uv",
+            json!({ "pull_requests": "write" }),
+        );
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+        assert_eq!(verified.target_repository.as_str(), "astral-sh/uv");
+        assert_eq!(*verified.target_repository_id, 699532645);
+        assert_eq!(verified.git_ref.as_str(), "refs/pull/20474/merge");
+        assert_eq!(
+            serde_json::to_value(verified.permissions).unwrap(),
+            json!({ "pull_requests": "write" })
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_invalid_uv_security_review_publisher_claims() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/ci.yml",
+                "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "pull_requests": "write" },
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut valid_claims = fixture.valid_claims();
+        valid_claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+        valid_claims["repository"] = json!("astral-sh/uv");
+        valid_claims["repository_id"] = json!(699532645);
+        valid_claims["ref"] = json!("refs/pull/20474/merge");
+        valid_claims["event_name"] = json!("pull_request");
+        valid_claims["workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/ci.yml@refs/pull/20474/merge");
+        valid_claims["job_workflow_ref"] = json!(
+            "astral-sh/uv/.github/workflows/pull-request-security-review.yml@refs/pull/20474/merge"
+        );
+        valid_claims["environment"] = json!("automations");
+
+        for (field, value, expected_code) in [
+            (
+                "sub",
+                json!("repo:astral-sh/uv-dev:environment:automations"),
+                "subject_not_allowed",
+            ),
+            (
+                "repository",
+                json!("astral-sh/uv-dev"),
+                "repository_not_allowed",
+            ),
+            (
+                "repository_id",
+                json!(1302176231),
+                "repository_id_not_allowed",
+            ),
+            ("ref", json!("refs/heads/main"), "ref_not_allowed"),
+            ("ref", json!("refs/pull/20474/head"), "ref_not_allowed"),
+            ("ref", json!("refs/pull/0/merge"), "ref_not_allowed"),
+            (
+                "workflow_ref",
+                json!("astral-sh/uv/.github/workflows/release.yml@refs/pull/20474/merge"),
+                "workflow_not_allowed",
+            ),
+            (
+                "job_workflow_ref",
+                json!("astral-sh/uv/.github/workflows/release.yml@refs/pull/20474/merge"),
+                "workflow_not_allowed",
+            ),
+            ("job_workflow_ref", json!(null), "workflow_not_allowed"),
+            ("environment", json!("release"), "environment_not_allowed"),
+            ("event_name", json!("push"), "event_not_allowed"),
+        ] {
+            let mut claims = valid_claims.clone();
+            claims[field] = value;
+            let token = fixture.sign_claims(claims);
+            let request = fixture.make_scoped_request(
+                &token,
+                "astral-sh/uv",
+                json!({ "pull_requests": "write" }),
+            );
+
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+
+            assert_eq!(error.code(), expected_code, "field {field}");
+        }
+
+        let token = fixture.sign_claims(valid_claims);
+        let wrong_target = fixture.make_scoped_request(
+            &token,
+            "astral-sh/uv-dev",
+            json!({ "pull_requests": "write" }),
+        );
+        let error = verify_oidc_claims(&config, &wrong_target)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "target_repository_not_allowed");
+
+        for permissions in [
+            json!({ "contents": "read" }),
+            json!({ "pull_requests": "write", "contents": "read" }),
+            json!({ "pull_requests": "write", "workflows": "write" }),
+        ] {
+            let request = fixture.make_scoped_request(&token, "astral-sh/uv", permissions);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert_eq!(error.code(), "permissions_not_allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_does_not_mix_caller_and_reusable_workflow_paths() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/ci.yml",
+                "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "pull_requests": "write" },
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645
+            }, {
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/other-ci.yml",
+                "job_workflow_path": ".github/workflows/publish.yml",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "contents": "write" },
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+        claims["repository"] = json!("astral-sh/uv");
+        claims["repository_id"] = json!(699532645);
+        claims["ref"] = json!("refs/pull/20474/merge");
+        claims["event_name"] = json!("pull_request");
+        claims["workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/ci.yml@refs/pull/20474/merge");
+        claims["job_workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/publish.yml@refs/pull/20474/merge");
+        claims["environment"] = json!("automations");
+        let token = fixture.sign_claims(claims);
+        let request =
+            fixture.make_scoped_request(&token, "astral-sh/uv-dev", json!({ "contents": "write" }));
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+
+        assert_eq!(error.code(), "workflow_not_allowed");
     }
 
     #[tokio::test]

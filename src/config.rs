@@ -31,6 +31,7 @@ pub struct PolicyRule {
     repository_id: RepositoryId,
     git_ref: GitRef,
     workflow_path: WorkflowPath,
+    job_workflow_path: Option<WorkflowPath>,
     environment: Option<EnvironmentName>,
     allowed_events: Vec<EventName>,
     permissions: Permissions,
@@ -59,6 +60,8 @@ struct RawPolicyRule {
     #[serde(rename = "ref")]
     git_ref: String,
     workflow_path: String,
+    #[serde(default)]
+    job_workflow_path: Option<String>,
     #[serde(default)]
     environment: Option<String>,
     #[serde(default = "default_allowed_events")]
@@ -105,6 +108,19 @@ fn is_valid_git_ref(value: &str) -> bool {
         || value
             .strip_prefix("refs/tags/")
             .is_some_and(|suffix| !suffix.is_empty())
+        || value == "refs/pull/*/merge"
+        || is_pull_request_merge_ref(value)
+}
+
+fn is_pull_request_merge_ref(value: &str) -> bool {
+    value
+        .strip_prefix("refs/pull/")
+        .and_then(|suffix| suffix.strip_suffix("/merge"))
+        .is_some_and(|number| {
+            !number.is_empty()
+                && !number.starts_with('0')
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn is_valid_workflow_path(value: &str) -> bool {
@@ -115,7 +131,7 @@ fn is_valid_workflow_path(value: &str) -> bool {
 }
 
 fn is_valid_event_name(value: &str) -> bool {
-    matches!(value, "push" | "workflow_dispatch")
+    matches!(value, "push" | "pull_request" | "workflow_dispatch")
 }
 
 fn default_allowed_events() -> Vec<String> {
@@ -222,6 +238,10 @@ impl PolicyRule {
         &self.workflow_path
     }
 
+    pub fn job_workflow_path(&self) -> Option<&WorkflowPath> {
+        self.job_workflow_path.as_ref()
+    }
+
     pub fn environment(&self) -> Option<&EnvironmentName> {
         self.environment.as_ref()
     }
@@ -291,6 +311,13 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
         if allowed_events.is_empty() {
             return Err(AppError::InvalidPolicy);
         }
+        if raw.git_ref == "refs/pull/*/merge"
+            && allowed_events
+                .iter()
+                .any(|event: &EventName| event.as_str() != "pull_request")
+        {
+            return Err(AppError::InvalidPolicy);
+        }
 
         let target = match (raw.target_repository, raw.target_repository_id) {
             (Some(repository), Some(repository_id)) => Some(RepositoryTarget {
@@ -310,11 +337,22 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             repository_id: raw.repository_id,
             git_ref: raw.git_ref.try_into()?,
             workflow_path: raw.workflow_path.try_into()?,
+            job_workflow_path: raw.job_workflow_path.map(TryInto::try_into).transpose()?,
             environment: raw.environment.map(TryInto::try_into).transpose()?,
             allowed_events,
             permissions: raw.permissions.unwrap_or_else(Permissions::contents_write),
             target,
         })
+    }
+}
+
+impl GitRef {
+    pub fn matches(&self, value: &str) -> bool {
+        if self.as_str() == "refs/pull/*/merge" {
+            is_pull_request_merge_ref(value)
+        } else {
+            self.as_str() == value
+        }
     }
 }
 
@@ -520,6 +558,40 @@ mod tests {
     }
 
     #[test]
+    fn policy_accepts_a_pull_request_reusable_workflow_rule() {
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/ci.yml",
+                "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "pull_requests": "write" },
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645
+            }]
+        }))
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(rule.git_ref().as_str(), "refs/pull/*/merge");
+        assert_eq!(rule.workflow_path().as_str(), ".github/workflows/ci.yml");
+        assert_eq!(
+            rule.job_workflow_path().unwrap().as_str(),
+            ".github/workflows/pull-request-security-review.yml"
+        );
+        assert_eq!(rule.allowed_events()[0].as_str(), "pull_request");
+        assert_eq!(
+            serde_json::to_value(rule.permissions()).unwrap(),
+            json!({ "pull_requests": "write" })
+        );
+    }
+
+    #[test]
     fn policy_rejects_empty_strings() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "expected_audience": "",
@@ -583,7 +655,7 @@ mod tests {
         for allowed_events in [
             json!([]),
             json!([""]),
-            json!(["pull_request"]),
+            json!(["workflow_run"]),
             json!(["push", "pull_request_target"]),
         ] {
             let result: Result<Policy, _> = serde_json::from_value(json!({
@@ -594,6 +666,31 @@ mod tests {
                     "repository_id": 42,
                     "ref": "refs/heads/main",
                     "workflow_path": ".github/workflows/release.yml",
+                    "allowed_events": allowed_events
+                }]
+            }));
+
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn policy_rejects_non_pull_request_events_for_a_pull_request_ref_pattern() {
+        for allowed_events in [
+            json!(["push"]),
+            json!(["workflow_dispatch"]),
+            json!(["pull_request", "push"]),
+        ] {
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [{
+                    "subject": "repo:astral-sh/uv:environment:automations",
+                    "repository": "astral-sh/uv",
+                    "repository_id": 699532645,
+                    "ref": "refs/pull/*/merge",
+                    "workflow_path": ".github/workflows/ci.yml",
+                    "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                    "environment": "automations",
                     "allowed_events": allowed_events
                 }]
             }));
@@ -634,8 +731,27 @@ mod tests {
     fn git_ref_rejects_non_canonical_refs() {
         assert!(GitRef::try_from("main").is_err());
         assert!(GitRef::try_from("refs/pull/1/head").is_err());
+        assert!(GitRef::try_from("refs/pull/0/merge").is_err());
+        assert!(GitRef::try_from("refs/pull/01/merge").is_err());
+        assert!(GitRef::try_from("refs/pull/one/merge").is_err());
+        assert!(GitRef::try_from("refs/pull/*/head").is_err());
+        assert!(GitRef::try_from("refs/pull/1/merge").is_ok());
+        assert!(GitRef::try_from("refs/pull/*/merge").is_ok());
         assert!(GitRef::try_from("refs/heads/main").is_ok());
         assert!(GitRef::try_from("refs/tags/v1.2.3").is_ok());
+    }
+
+    #[test]
+    fn pull_request_ref_pattern_matches_only_canonical_merge_refs() {
+        let pattern = GitRef::try_from("refs/pull/*/merge").unwrap();
+
+        assert!(pattern.matches("refs/pull/1/merge"));
+        assert!(pattern.matches("refs/pull/20474/merge"));
+        assert!(!pattern.matches("refs/pull/0/merge"));
+        assert!(!pattern.matches("refs/pull/01/merge"));
+        assert!(!pattern.matches("refs/pull/one/merge"));
+        assert!(!pattern.matches("refs/pull/1/head"));
+        assert!(!pattern.matches("refs/heads/main"));
     }
 
     #[test]
