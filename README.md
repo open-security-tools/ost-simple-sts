@@ -126,8 +126,8 @@ Requests to the following GitHub routes are expected:
 The installation lookup retries transient failures and secondary rate limits once with bounded
 backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
 keys and installation tokens are redacted from debug output. Outbound requests require HTTPS and
-never follow redirects, so credentials and token-request payloads cannot be forwarded to an
-unexpected destination.
+never follow redirects. GitHub API requests are restricted to `api.github.com`, so credentials and
+token-request payloads cannot be forwarded to an unexpected destination.
 
 Errors return a stable machine-readable code and a human-readable message:
 
