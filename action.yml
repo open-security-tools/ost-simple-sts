@@ -6,7 +6,7 @@ inputs:
     description: Full HTTPS URL of the simple-sts exchange endpoint.
     required: true
   audience:
-    description: OIDC audience configured in the simple-sts policy.
+    description: HTTPS OIDC audience configured in the simple-sts policy.
     required: true
 
 outputs:
