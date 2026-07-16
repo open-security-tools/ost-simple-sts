@@ -93,7 +93,7 @@ The exchange succeeds only when all of these checks pass:
 1. The reusable workflow, if one is used
 
 `expected_audience` and a non-empty `rules` list are required. `allowed_events` can contain only
-`push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
+`issues`, `push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,

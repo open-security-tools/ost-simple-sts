@@ -131,7 +131,10 @@ fn is_valid_workflow_path(value: &str) -> bool {
 }
 
 fn is_valid_event_name(value: &str) -> bool {
-    matches!(value, "push" | "pull_request" | "workflow_dispatch")
+    matches!(
+        value,
+        "issues" | "push" | "pull_request" | "workflow_dispatch"
+    )
 }
 
 fn default_allowed_events() -> Vec<String> {
@@ -588,6 +591,45 @@ mod tests {
         assert_eq!(
             serde_json::to_value(rule.permissions()).unwrap(),
             json!({ "pull_requests": "write" })
+        );
+    }
+
+    #[test]
+    fn policy_accepts_an_issues_reusable_workflow_rule() {
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/issue-triage.yml",
+                "job_workflow_path": ".github/workflows/reproduce-bug.yml",
+                "environment": "automations",
+                "allowed_events": ["issues", "workflow_dispatch"],
+                "permissions": { "contents": "write", "pull_requests": "write" },
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(rule.git_ref().as_str(), "refs/heads/main");
+        assert_eq!(
+            rule.workflow_path().as_str(),
+            ".github/workflows/issue-triage.yml"
+        );
+        assert_eq!(
+            rule.job_workflow_path().unwrap().as_str(),
+            ".github/workflows/reproduce-bug.yml"
+        );
+        assert_eq!(
+            rule.allowed_events()
+                .iter()
+                .map(|event| event.as_str())
+                .collect::<Vec<_>>(),
+            ["issues", "workflow_dispatch"]
         );
     }
 
