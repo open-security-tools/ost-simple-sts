@@ -4,10 +4,9 @@ GitHub Actions workflows sometimes need more access than the built-in `GITHUB_TO
 Keeping a GitHub App private key in every repository that needs that access creates a long-lived
 secret with a wide blast radius.
 
-`ost-simple-sts` is a small AWS Lambda that exchanges a GitHub Actions OIDC token for a
-repository-scoped GitHub App installation token. The App private key stays in AWS Secrets Manager,
-and the exchange succeeds only for the configured repository, workflow, ref, environment, and OIDC
-subject.
+`ost-simple-sts` lets an approved GitHub Actions workflow obtain a short-lived GitHub App token
+without storing the App's private key in the repository. Only the configured repository, workflow,
+branch or tag, and environment can request a token.
 
 ## GitHub Actions workflow
 
@@ -41,14 +40,10 @@ jobs:
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
-The exchange action requires `exchange-url` to be the configured HTTPS `audience` URL followed by
-`/exchange`. This prevents a misleading or attacker-controlled endpoint from receiving the OIDC
-token. Set the policy `expected_audience` to that base URL; non-URL audiences are not supported by
-the bundled action. The action safely writes returned values, masks both the OIDC token and the
-returned installation token, and exposes `token`, `expires-at`, `repository`, and `ref` outputs.
-The action revokes the installation token when the job finishes, including after a failed step. Do
-not pass the token to another job. If revocation cannot complete, the action emits a warning and
-GitHub installation tokens expire after one hour. Pin actions to a commit SHA in production.
+Set `audience` and the policy `expected_audience` to the deployed API URL, and `exchange-url` to
+the same URL followed by `/exchange`. The action returns a short-lived token and revokes it when the
+job finishes, including after a failed step. Do not pass the token to another job. Pin actions to a
+commit SHA in production.
 
 ## GitHub App
 
@@ -57,8 +52,8 @@ The GitHub App needs the following repository permissions:
 - **Contents**: read and write
 - **Metadata**: read-only
 
-Install the App on each repository allowed by the policy. The broker requests an installation token
-for exactly the matched repository ID and only the `contents: write` permission.
+Install the App on each repository allowed by the policy. The service requests a token with only
+`contents: write` for the matched repository.
 
 ## Policy
 
@@ -81,80 +76,30 @@ ignored `policy.json` and replace every example value for the calling repository
 }
 ```
 
-`expected_audience` and a non-empty `rules` list are required. Within each rule, all fields except
-`environment` are required, and unknown fields are rejected. Each rule binds both the mutable
-repository name and immutable repository ID; the ID can be obtained with
-`gh api repos/OWNER/REPO --jq .id`.
+The exchange succeeds only when all of these checks pass:
 
-Every claim must match the same rule. Repositories, refs, workflows, and environments from
-different rules are never combined.
+1. The repository name and ID
+1. The workflow file and Git ref
+1. The OIDC subject, including the environment when one is configured
+1. The `workflow_dispatch` event
+1. The reusable workflow, if one is used
 
-`subject` must exactly match the `sub` claim emitted by the calling job. Jobs using an
-environment have an environment subject. New repositories use GitHub's immutable subject format,
-shown above; repositories using the previous format would use
-`repo:example-org/example-repo:environment:release` instead. Keep the environment's deployment
-rules restricted to the intended ref.
+`expected_audience` and a non-empty `rules` list are required. All rule fields except `environment`
+are required, and unknown fields are rejected. Values from different rules are never combined.
 
-The caller's `workflow_ref` must match the selected rule's repository, workflow path, and ref. If
-the job runs in a reusable workflow, its `job_workflow_ref` must match too; a trusted caller cannot
-delegate token minting to a different reusable workflow.
+`subject` must exactly match the OIDC subject emitted by the calling job. New repositories use the
+immutable subject format shown above, which includes both the owner and repository IDs. Find them
+with:
 
-## Exchange
-
-The broker exposes two routes:
-
-- `GET /health`
-- `POST /exchange`
-
-The exchange lifecycle is roughly:
-
-1. Receive an OIDC token in `Authorization: Bearer <oidc-jwt>`
-1. Validate the JWT signature against the cached GitHub Actions JWKS
-1. Validate issuer, audience, subject, expiry, not-before, and issued-at claims
-1. Match one configured rule's repository name and ID, ref, workflow path, and environment
-1. Require a `workflow_dispatch` event
-1. Claim the OIDC `jti` with a conditional DynamoDB write to prevent replay
-1. Mint a GitHub App JWT and resolve the repository installation
-1. Mint and return a repository-scoped installation token
-
-The JWKS cache refreshes at most once every 30 seconds for an unknown key ID, allowing key rotation
-without letting unauthenticated requests amplify outbound traffic.
-
-Requests to the following GitHub routes are expected:
-
-- `GET /repos/{owner}/{repo}/installation`
-- `POST /app/installations/{installation_id}/access_tokens`
-
-The installation lookup retries transient failures and secondary rate limits once with bounded
-backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
-keys and installation tokens are redacted from debug output. Outbound requests require HTTPS and
-never follow redirects. GitHub API requests are restricted to `api.github.com`, so credentials and
-token-request payloads cannot be forwarded to an unexpected destination.
-
-Errors return a stable machine-readable code and a human-readable message:
-
-```json
-{
-  "code": "repository_not_allowed",
-  "error": "repository is not allowed"
-}
+```bash
+gh api repos/OWNER/REPO --jq '{owner_id: .owner.id, repository_id: .id}'
 ```
 
-Policy denials return `403`, invalid or expired OIDC tokens return `401`, replayed tokens return
-`409`, GitHub App configuration or permission failures return `422` or `424`, and upstream outages
-return `502` or `503`.
+Repositories using the previous subject format would use
+`repo:example-org/example-repo:environment:release` instead. Keep the environment's deployment
+rules restricted to the intended branch.
 
 ## Deploy
-
-The included SAM template provisions one Lambda, one HTTP API, and one DynamoDB table with TTL for
-OIDC replay protection. The Lambda has permission to write replay records, read the App ID from SSM
-Parameter Store, and read only the named App private key from Secrets Manager. The public API is
-limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
-Metadata-only HTTP access logs and Lambda logs are retained for 30 days. The stack creates alarms
-for Lambda errors and throttles, API 5xx responses, GitHub App dependency failures (HTTP 422 and
-424), and sustained API 4xx spikes; set the optional `AlarmTopicArn` parameter to an SNS topic to
-receive notifications. Access logs deliberately omit request headers, OIDC claims, and response
-bodies.
 
 Create the local configuration, set the App ID and private-key location in `.env`, and edit the
 policy for the calling repositories:
@@ -168,10 +113,20 @@ make deploy-secrets
 make deploy
 ```
 
-`make deploy-secrets` stores the App ID and private key in AWS. `make deploy` compacts the local
-policy and deploys the SAM stack. `POLICY_FILE`, `STACK_NAME`, `APP_ID_PARAMETER`,
-`JTI_TABLE_NAME`, and the optional `ALARM_TOPIC_ARN` can be overridden in `.env`;
+The stack provisions the exchange API, Lambda, replay protection, logging, and alarms. The App ID
+and private key are stored in AWS. Deployment settings can be overridden in `.env`;
 `ENV_FILE=/path/to/.env make deploy` selects another environment file.
+
+## How it works
+
+The exchange lifecycle is roughly:
+
+1. Receive a GitHub Actions OIDC token
+1. Validate the token and match one configured policy rule
+1. Reject tokens that have already been exchanged
+1. Mint and return a repository-scoped GitHub App token
+
+See [`OVERVIEW.md`](./OVERVIEW.md) for the security, API, and deployment details.
 
 ## Development
 
@@ -180,5 +135,3 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 ```
-
-For a module-by-module map, see [`OVERVIEW.md`](./OVERVIEW.md).

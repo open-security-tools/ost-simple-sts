@@ -26,6 +26,71 @@ src/response.rs                no-store JSON responses and token redaction
 1. The repository installation is resolved.
 1. A repository-scoped installation token is minted and returned to the caller.
 
+## Exchange API
+
+The service exposes two routes:
+
+- `GET /health`
+- `POST /exchange`
+
+The bundled action requires `exchange-url` to be the configured HTTPS `audience` URL followed by
+`/exchange`, preventing an unexpected endpoint from receiving the OIDC token. Non-URL audiences are
+not supported. The action safely writes returned values, masks both the OIDC and installation
+tokens, and exposes `token`, `expires-at`, `repository`, and `ref` outputs. It revokes the
+installation token when the job finishes; if revocation cannot complete, the action emits a warning
+and the token expires after one hour.
+
+The exchange receives an OIDC token in `Authorization: Bearer <oidc-jwt>`, validates its signature
+against the cached GitHub Actions JWKS, and validates its issuer, audience, subject, expiry,
+not-before, and issued-at claims. The caller's `workflow_ref` must match the selected rule's
+repository, workflow path, and ref. If the job runs in a reusable workflow, its
+`job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
+reusable workflow.
+
+The JWKS cache refreshes at most once every 30 seconds for an unknown key ID, allowing key rotation
+without letting unauthenticated requests amplify outbound traffic. The OIDC `jti` is claimed with
+a conditional DynamoDB write to prevent replay.
+
+Requests to the following GitHub routes are expected:
+
+- `GET /repos/{owner}/{repo}/installation`
+- `POST /app/installations/{installation_id}/access_tokens`
+
+The installation lookup retries transient failures and secondary rate limits once with bounded
+backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
+keys and installation tokens are redacted from debug output. Outbound requests require HTTPS and
+never follow redirects. GitHub API requests are restricted to `api.github.com`, so credentials and
+token-request payloads cannot be forwarded to an unexpected destination.
+
+Errors return a stable machine-readable code and a human-readable message:
+
+```json
+{
+  "code": "repository_not_allowed",
+  "error": "repository is not allowed"
+}
+```
+
+Policy denials return `403`, invalid or expired OIDC tokens return `401`, replayed tokens return
+`409`, GitHub App configuration or permission failures return `422` or `424`, and upstream outages
+return `502` or `503`.
+
+## Deployment
+
+The SAM template provisions one Lambda, one HTTP API, and one DynamoDB table with TTL for OIDC
+replay protection. The Lambda has permission to write replay records, read the App ID from SSM
+Parameter Store, and read only the named App private key from Secrets Manager. The public API is
+limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
+Metadata-only HTTP access logs and Lambda logs are retained for 30 days. The stack creates alarms
+for Lambda errors and throttles, API 5xx responses, GitHub App dependency failures (HTTP 422 and
+424), and sustained API 4xx spikes; set the optional `AlarmTopicArn` parameter to an SNS topic to
+receive notifications. Access logs deliberately omit request headers, OIDC claims, and response
+bodies.
+
+`make deploy-secrets` stores the App ID and private key in AWS. `make deploy` compacts the local
+policy and deploys the SAM stack. `POLICY_FILE`, `STACK_NAME`, `APP_ID_PARAMETER`,
+`JTI_TABLE_NAME`, and the optional `ALARM_TOPIC_ARN` can be overridden in `.env`.
+
 ## Validated domain types
 
 - `Policy`, `PolicyRule`, `Audience`, `Subject`, `GitRef`, `WorkflowPath`, `EnvironmentName`
