@@ -132,9 +132,10 @@ impl JwksCache {
 #[cfg(test)]
 mod tests {
     use super::{CachedJwks, JwksCache, JWKS_REFRESH_COOLDOWN};
-    use crate::error::AppError;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use rsa::traits::PublicKeyParts;
+    use crate::{
+        error::AppError,
+        test_keys::{RSA_EXPONENT, RSA_MODULUS},
+    };
     use serde_json::json;
     use std::time::{Duration, Instant};
     use wiremock::{
@@ -147,17 +148,11 @@ mod tests {
     }
 
     fn jwks_body(kid: &str) -> serde_json::Value {
-        let mut rng = rand::thread_rng();
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public_key = private_key.to_public_key();
-        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
-
         json!({
             "keys": [{
                 "kty": "RSA",
-                "n": n,
-                "e": e,
+                "n": RSA_MODULUS,
+                "e": RSA_EXPONENT,
                 "kid": kid,
                 "alg": "RS256",
                 "use": "sig"
@@ -202,15 +197,13 @@ mod tests {
         let error = cache
             .decoding_key_for("missing-kid")
             .await
-            .err()
-            .expect("expected missing kid to fail");
+            .expect_err("expected missing kid to fail");
         assert!(matches!(error, AppError::InvalidOidcToken));
 
         let error = cache
             .decoding_key_for("another-missing-kid")
             .await
-            .err()
-            .expect("expected missing kid to fail");
+            .expect_err("expected missing kid to fail");
         assert!(matches!(error, AppError::InvalidOidcToken));
 
         cache.decoding_key_for("known-kid").await.unwrap();
@@ -293,15 +286,13 @@ mod tests {
         let error = cache
             .decoding_key_for("any-kid")
             .await
-            .err()
-            .expect("expected jwks fetch to fail");
+            .expect_err("expected jwks fetch to fail");
         assert!(matches!(error, AppError::OidcVerificationUnavailable));
 
         let error = cache
             .decoding_key_for("another-kid")
             .await
-            .err()
-            .expect("expected failed refresh to be cooled down");
+            .expect_err("expected failed refresh to be cooled down");
         assert!(matches!(error, AppError::OidcVerificationUnavailable));
     }
 }

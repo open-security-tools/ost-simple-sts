@@ -12,6 +12,8 @@
 #   APP_ID_PARAMETER            SSM parameter name for App ID
 #   APP_PRIVATE_KEY_SECRET_NAME Secrets Manager secret name
 #   JTI_TABLE_NAME              DynamoDB table name for JTI replay guard
+# Optional .env variables:
+#   ALARM_TOPIC_ARN             SNS topic ARN for CloudWatch alarm notifications
 #
 set -euo pipefail
 
@@ -76,4 +78,5 @@ sam deploy \
     "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
     "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
     "ParameterKey=JtiTableName,ParameterValue=$JTI_TABLE_NAME" \
+    "ParameterKey=AlarmTopicArn,ParameterValue='${ALARM_TOPIC_ARN:-}'" \
   "$@"

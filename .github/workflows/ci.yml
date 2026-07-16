@@ -95,3 +95,17 @@ jobs:
         run: rustup show
       - name: "Cargo test"
         run: cargo test --workspace --locked
+
+  audit:
+    name: "cargo audit"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: "Cargo audit"
+        run: cargo audit

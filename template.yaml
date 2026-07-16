@@ -25,14 +25,41 @@ Parameters:
   JtiTableName:
     Type: String
     Default: ost-jti-replay
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional SNS topic ARN for CloudWatch alarm notifications
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
 
 Resources:
   Api:
     Type: AWS::Serverless::HttpApi
     Properties:
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency"}
       DefaultRouteSettings:
         ThrottlingBurstLimit: 200
         ThrottlingRateLimit: 100
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/${AWS::StackName}/http-api
+      RetentionInDays: 30
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-simple-sts
+      RetentionInDays: 30
 
   JtiTable:
     Type: AWS::DynamoDB::Table
@@ -57,12 +84,15 @@ Resources:
       CodeUri: .
       Handler: bootstrap
       ReservedConcurrentExecutions: 100
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
       Environment:
         Variables:
           POLICY_JSON: !Ref PolicyJson
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           JTI_TABLE_NAME: !Ref JtiTableName
+          RUST_LOG: warn
       Events:
         Health:
           Type: HttpApi
@@ -91,6 +121,100 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}-??????
+
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda invocation errors for the credential broker
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SimpleStsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  FunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda throttles for the credential broker
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SimpleStsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP API server errors for the credential broker
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref Api
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  ApiDependencyFailureMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiAccessLogGroup
+      FilterPattern: '{ ($.status = "422") || ($.status = "424") }'
+      MetricTransformations:
+        - MetricNamespace: !Sub ${AWS::StackName}/simple-sts
+          MetricName: DependencyFailures
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  ApiDependencyFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: GitHub App authentication, permission, or token-request failures
+      Namespace: !Sub ${AWS::StackName}/simple-sts
+      MetricName: DependencyFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  Api4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Sustained HTTP API client-error spike for the credential broker
+      Namespace: AWS/ApiGateway
+      MetricName: 4xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref Api
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
 Outputs:
   ApiUrl:
