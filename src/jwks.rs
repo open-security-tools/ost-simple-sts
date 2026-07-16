@@ -132,9 +132,10 @@ impl JwksCache {
 #[cfg(test)]
 mod tests {
     use super::{CachedJwks, JwksCache, JWKS_REFRESH_COOLDOWN};
-    use crate::error::AppError;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use rsa::traits::PublicKeyParts;
+    use crate::{
+        error::AppError,
+        test_keys::{RSA_EXPONENT, RSA_MODULUS},
+    };
     use serde_json::json;
     use std::time::{Duration, Instant};
     use wiremock::{
@@ -147,17 +148,11 @@ mod tests {
     }
 
     fn jwks_body(kid: &str) -> serde_json::Value {
-        let mut rng = rand::thread_rng();
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public_key = private_key.to_public_key();
-        let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
-
         json!({
             "keys": [{
                 "kty": "RSA",
-                "n": n,
-                "e": e,
+                "n": RSA_MODULUS,
+                "e": RSA_EXPONENT,
                 "kid": kid,
                 "alg": "RS256",
                 "use": "sig"

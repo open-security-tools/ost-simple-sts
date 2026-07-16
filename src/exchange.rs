@@ -347,12 +347,11 @@ mod integration_tests {
         error::AppError,
         github::GithubApiBase,
         jwks::JwksCache,
+        test_keys::{RSA_EXPONENT, RSA_MODULUS, RSA_PRIVATE_KEY},
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use lambda_http::{http::Request, Body};
-    use rsa::pkcs8::EncodePrivateKey;
-    use rsa::traits::PublicKeyParts;
     use serde_json::json;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -371,25 +370,15 @@ mod integration_tests {
         async fn new() -> Self {
             let server = MockServer::start().await;
 
-            let mut rng = rand::thread_rng();
-            let private_key =
-                rsa::RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate RSA key");
-            let pem = private_key
-                .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-                .expect("failed to encode private key");
-
-            let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
-            let public_key = private_key.to_public_key();
-            let n = URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
-            let e = URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+            let encoding_key = EncodingKey::from_rsa_pem(RSA_PRIVATE_KEY.as_bytes()).unwrap();
 
             let kid = "test-kid-001".to_string();
 
             let jwks_response = json!({
                 "keys": [{
                     "kty": "RSA",
-                    "n": n,
-                    "e": e,
+                    "n": RSA_MODULUS,
+                    "e": RSA_EXPONENT,
                     "kid": kid,
                     "alg": "RS256",
                     "use": "sig",

@@ -60,6 +60,8 @@ mod github;
 mod jwks;
 mod replay;
 mod response;
+#[cfg(test)]
+mod test_keys;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
