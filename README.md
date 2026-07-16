@@ -133,7 +133,8 @@ Errors return a stable machine-readable code and a human-readable message:
 ```
 
 Policy denials return `403`, invalid or expired OIDC tokens return `401`, replayed tokens return
-`409`, and upstream failures return `502` or `503`.
+`409`, GitHub App configuration or permission failures return `422` or `424`, and upstream outages
+return `502` or `503`.
 
 ## Deploy
 
