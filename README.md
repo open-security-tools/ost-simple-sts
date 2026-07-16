@@ -6,7 +6,8 @@ secret with a wide blast radius.
 
 `ost-simple-sts` lets an approved GitHub Actions workflow obtain a short-lived GitHub App token
 without storing the App's private key in the repository. Only the configured repository, workflow,
-branch or tag, and environment can request a token.
+branch or tag, event, and environment can request a token. A rule can optionally issue access to a
+different, explicitly configured target repository.
 
 ## GitHub Actions workflow
 
@@ -33,6 +34,9 @@ jobs:
         with:
           exchange-url: https://example.execute-api.us-east-1.amazonaws.com/exchange
           audience: https://example.execute-api.us-east-1.amazonaws.com
+          repository: example-org/example-repo
+          permissions: |
+            contents: write
       - uses: actions/checkout@<commit-sha>
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -41,19 +45,21 @@ jobs:
 ```
 
 Set `audience` and the policy `expected_audience` to the deployed API URL, and `exchange-url` to
-the same URL followed by `/exchange`. The action returns a short-lived token and revokes it when the
-job finishes, including after a failed step. Do not pass the token to another job. Pin actions to a
-commit SHA in production.
+the same URL followed by `/exchange`. Set `repository` to the requested target repository and list
+one GitHub App repository permission per line in `permissions`. The action returns a short-lived
+token and revokes it when the job finishes, including after a failed step. Do not pass the token to
+another job. Pin actions to a commit SHA in production.
 
 ## GitHub App
 
-The GitHub App needs the following repository permissions:
+For the examples below, the GitHub App needs the following repository permissions:
 
 - **Contents**: read and write
 - **Metadata**: read-only
 
-Install the App on each repository allowed by the policy. The service requests a token with only
-`contents: write` for the matched repository.
+Install the App on each target repository allowed by the policy; it does not need to be installed
+on a separate calling repository. The service requests only the permissions selected by the caller
+and allowed by the matched policy rule.
 
 ## Policy
 
@@ -70,6 +76,8 @@ ignored `policy.json` and replace every example value for the calling repository
       "repository_id": 789012,
       "ref": "refs/heads/main",
       "workflow_path": ".github/workflows/release.yml",
+      "allowed_events": ["workflow_dispatch"],
+      "permissions": { "contents": "write" },
       "environment": "release"
     }
   ]
@@ -81,23 +89,59 @@ The exchange succeeds only when all of these checks pass:
 1. The repository name and ID
 1. The workflow file and Git ref
 1. The OIDC subject, including the environment when one is configured
-1. The `workflow_dispatch` event
+1. An event allowed by the matched rule
 1. The reusable workflow, if one is used
 
-`expected_audience` and a non-empty `rules` list are required. All rule fields except `environment`
-are required, and unknown fields are rejected. Values from different rules are never combined.
+`expected_audience` and a non-empty `rules` list are required. `allowed_events` can contain only
+`push` and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
+allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
+issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
+subset or lower level, but never an additional or broader permission. `environment`,
+`target_repository`, and `target_repository_id` are optional; the two target fields must either
+both be present or both be omitted. All other rule fields are required, unknown fields and duplicate
+permissions are rejected, and values from different rules are never combined.
 
-`subject` must exactly match the OIDC subject emitted by the calling job. New repositories use the
-immutable subject format shown above, which includes both the owner and repository IDs. Find them
-with:
+A workflow in one repository can be allowed to update a different repository without granting the
+caller access. For example, an upstream fork-sync workflow can receive a token scoped only to the
+fork:
 
-```bash
-gh api repos/OWNER/REPO --jq '{owner_id: .owner.id, repository_id: .id}'
+```json
+{
+  "subject": "repo:astral-sh/uv:environment:automations",
+  "repository": "astral-sh/uv",
+  "repository_id": 699532645,
+  "ref": "refs/heads/main",
+  "workflow_path": ".github/workflows/sync-uv-dev.yml",
+  "environment": "automations",
+  "allowed_events": ["push", "workflow_dispatch"],
+  "permissions": { "contents": "write" },
+  "target_repository": "astral-sh/uv-dev",
+  "target_repository_id": 1302176231
+}
 ```
 
-Repositories using the previous subject format would use
-`repo:example-org/example-repo:environment:release` instead. Keep the environment's deployment
-rules restricted to the intended branch.
+The workflow requests the target and permission explicitly:
+
+```yaml
+repository: astral-sh/uv-dev
+permissions: |
+  contents: write
+```
+
+The scalar spelling `permissions: contents:write` is also accepted for a single permission. The App
+is installed on `astral-sh/uv-dev`, and the returned token has `contents: write` only for that
+repository. The `repository` action output reports the target repository. A cross-repository rule
+requires an explicit matching request; it cannot be exchanged using the legacy empty request.
+
+`subject` must exactly match the OIDC subject emitted by the calling job. The default subject format
+for an environment-bound job is `repo:OWNER/REPO:environment:ENVIRONMENT`. Always bind the
+immutable `repository_id` claim separately; find it with:
+
+```bash
+gh api repos/OWNER/REPO --jq '{repository_id: .id}'
+```
+
+Keep the environment's deployment rules restricted to the intended branch.
 
 ## Deploy
 

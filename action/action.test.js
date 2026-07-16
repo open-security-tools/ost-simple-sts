@@ -18,6 +18,8 @@ function environment(overrides = {}) {
   return {
     "INPUT_EXCHANGE-URL": exchangeUrl,
     INPUT_AUDIENCE: audience,
+    INPUT_REPOSITORY: "example/repository",
+    INPUT_PERMISSIONS: "contents:write",
     ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.actions.example/oidc?request=123",
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: "request-token",
     GITHUB_OUTPUT: "outputs",
@@ -70,6 +72,11 @@ test("exchanges an OIDC token, masks credentials, and saves revocation state", a
   assert.equal(calls[1].url, exchangeUrl);
   assert.equal(calls[1].options.method, "POST");
   assert.equal(calls[1].options.headers.authorization, "Bearer oidc%token\r\nmasked");
+  assert.equal(calls[1].options.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    repository: "example/repository",
+    permissions: { contents: "write" },
+  });
   assert.equal(calls[1].options.redirect, "error");
   assert.deepEqual(output, [
     "::add-mask::oidc%25token%0D%0Amasked\n",
@@ -98,6 +105,32 @@ test("rejects an unsafe exchange URL before requesting an OIDC token", async () 
   assert.equal(called, false);
 });
 
+test("rejects an unexpected returned repository while preserving revocation state", async () => {
+  const { files, appendFile } = memoryFiles();
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      token: "installation-token",
+      expires_at: expiresAt,
+      repository: "example/other",
+      ref: "refs/heads/main",
+    }),
+  ];
+
+  await assert.rejects(
+    runMain({
+      env: environment(),
+      appendFile,
+      fetchImpl: async () => responses.shift(),
+      uuid: () => "test-delimiter",
+      write: () => {},
+    }),
+    /returned repository does not match the requested repository/,
+  );
+  assert.match(files.get("state"), /token<<ghadelimiter_test-delimiter\ninstallation-token/);
+  assert.equal(files.has("outputs"), false);
+});
+
 test("requires the OIDC permission and a safe runner token URL", async () => {
   await assert.rejects(
     runMain({ env: environment({ ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" }) }),
@@ -107,6 +140,93 @@ test("requires the OIDC permission and a safe runner token URL", async () => {
     runMain({ env: environment({ ACTIONS_ID_TOKEN_REQUEST_URL: "http://token.actions.example/oidc" }) }),
     /ACTIONS_ID_TOKEN_REQUEST_URL must use HTTPS/,
   );
+});
+
+test("rejects a partial or unsupported scope before requesting an OIDC token", async () => {
+  let called = false;
+  const fetchImpl = async () => {
+    called = true;
+  };
+
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_REPOSITORY: "../other" }), fetchImpl }),
+    /repository must be OWNER\/REPO/,
+  );
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_REPOSITORY: "" }), fetchImpl }),
+    /repository and permissions must be provided together/,
+  );
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_PERMISSIONS: "members: read" }), fetchImpl }),
+    /unknown repository permission: members/,
+  );
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_PERMISSIONS: "contents:write,actions:write" }), fetchImpl }),
+    /one name: level entry per line/,
+  );
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_PERMISSIONS: "contents: admin" }), fetchImpl }),
+    /invalid level for repository permission: contents/,
+  );
+  await assert.rejects(
+    runMain({ env: environment({ INPUT_PERMISSIONS: "contents: read\ncontents: write" }), fetchImpl }),
+    /duplicate repository permission: contents/,
+  );
+  assert.equal(called, false);
+});
+
+test("sends multiple newline-delimited repository permissions as a JSON map", async () => {
+  const calls = [];
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      token: "installation-token",
+      expires_at: expiresAt,
+      repository: "example/repository",
+      ref: "refs/heads/main",
+    }),
+  ];
+
+  await runMain({
+    env: environment({ INPUT_PERMISSIONS: "contents: write\npull_requests: read\n" }),
+    appendFile: () => {},
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return responses.shift();
+    },
+    write: () => {},
+  });
+
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    repository: "example/repository",
+    permissions: { contents: "write", pull_requests: "read" },
+  });
+});
+
+test("preserves the legacy empty exchange request when no scope inputs are provided", async () => {
+  const calls = [];
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      token: "installation-token",
+      expires_at: expiresAt,
+      repository: "example/repository",
+      ref: "refs/heads/main",
+    }),
+  ];
+
+  await runMain({
+    env: environment({ INPUT_REPOSITORY: "", INPUT_PERMISSIONS: "" }),
+    appendFile: () => {},
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return responses.shift();
+    },
+    write: () => {},
+  });
+
+  assert.equal(calls[1].options.body, "");
+  assert.equal(calls[1].options.headers["content-type"], undefined);
 });
 
 test("requires Node proxy support when a proxy is configured", async () => {
@@ -120,7 +240,7 @@ test("does not retry a failed token exchange or expose its response", async () =
   let calls = 0;
   await assert.rejects(
     runMain({
-      env: environment(),
+      env: environment({ INPUT_REPOSITORY: "", INPUT_PERMISSIONS: "" }),
       fetchImpl: async () => {
         calls += 1;
         return calls === 1 ? response({ value: "oidc-token" }) : response({ token: "secret" }, 500);
@@ -170,7 +290,7 @@ test("rejects an output delimiter embedded in a returned value", async () => {
 
   await assert.rejects(
     runMain({
-      env: environment(),
+      env: environment({ INPUT_REPOSITORY: "", INPUT_PERMISSIONS: "" }),
       appendFile,
       fetchImpl: async () => responses.shift(),
       uuid: () => "test-delimiter",

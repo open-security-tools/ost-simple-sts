@@ -8,6 +8,8 @@ HTTP / Lambda
           ├── src/replay.rs    conditionally claim the OIDC jti in DynamoDB
           └── src/github/
               ├── api.rs       validated API base, headers, and bounded GET retries
+              ├── permissions.rs
+              │                validated repository permissions and access levels
               ├── repositories.rs
               │                validated repository and jti types
               └── tokens.rs    App JWT, installation lookup, and token creation
@@ -23,8 +25,8 @@ src/response.rs                no-store JSON responses and token redaction
 1. The JWT is validated against the Actions JWKS and configured policy.
 1. The `jti` is claimed in DynamoDB to prevent replay.
 1. A GitHub App JWT is minted from the configured App ID and private key.
-1. The repository installation is resolved.
-1. A repository-scoped installation token is minted and returned to the caller.
+1. The matched target repository installation is resolved.
+1. A target-repository-scoped installation token is minted and returned to the caller.
 
 ## Exchange API
 
@@ -40,12 +42,19 @@ tokens, and exposes `token`, `expires-at`, `repository`, and `ref` outputs. It r
 installation token when the job finishes; if revocation cannot complete, the action emits a warning
 and the token expires after one hour.
 
-The exchange receives an OIDC token in `Authorization: Bearer <oidc-jwt>`, validates its signature
-against the cached GitHub Actions JWKS, and validates its issuer, audience, subject, expiry,
+The exchange receives an OIDC token in `Authorization: Bearer <oidc-jwt>` and an optional bounded
+JSON body of the form `{"repository":"OWNER/REPO","permissions":{"contents":"write"}}`. It
+validates the token signature against the cached GitHub Actions JWKS and validates its issuer,
+audience, subject, expiry,
 not-before, and issued-at claims. The caller's `workflow_ref` must match the selected rule's
 repository, workflow path, and ref. If the job runs in a reusable workflow, its
 `job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
-reusable workflow.
+reusable workflow. The event must be listed in the matched rule's `allowed_events`. If a target
+repository is configured, the request body is required and its repository must exactly match that
+target. Installation lookup and token minting use only the matched target and never the calling
+repository. A legacy empty body remains supported for same-repository rules. Requested repository
+permissions must be a subset of the matching rule's configured permissions. The service rejects
+unknown, duplicate, or broader permissions.
 
 The JWKS cache refreshes at most once every 30 seconds for an unknown key ID, allowing key rotation
 without letting unauthenticated requests amplify outbound traffic. The OIDC `jti` is claimed with
@@ -71,9 +80,9 @@ Errors return a stable machine-readable code and a human-readable message:
 }
 ```
 
-Policy denials return `403`, invalid or expired OIDC tokens return `401`, replayed tokens return
-`409`, GitHub App configuration or permission failures return `422` or `424`, and upstream outages
-return `502` or `503`.
+Policy denials return `403`, invalid exchange bodies return `400`, invalid or expired OIDC tokens
+return `401`, replayed tokens return `409`, GitHub App configuration or permission failures return
+`422` or `424`, and upstream outages return `502` or `503`.
 
 ## Deployment
 

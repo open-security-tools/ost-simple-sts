@@ -8,6 +8,12 @@ inputs:
   audience:
     description: HTTPS OIDC audience configured in the simple-sts policy.
     required: true
+  repository:
+    description: Target repository requested from the simple-sts policy.
+    required: false
+  permissions:
+    description: Newline-delimited GitHub App repository permissions requested from the simple-sts policy.
+    required: false
 
 outputs:
   token:

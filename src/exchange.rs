@@ -1,18 +1,26 @@
 use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validation};
-use lambda_http::{http::header::AUTHORIZATION, Request};
+use lambda_http::{http::header::AUTHORIZATION, Body, Request};
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     config::{Config, GitRef},
     error::AppError,
-    github::{self, Jti, RepositoryFullName, RepositoryId},
+    github::{self, Jti, Permissions, RepositoryFullName, RepositoryId},
     replay,
 };
 
 const ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const CLOCK_TOLERANCE_SECONDS: u64 = 5;
 const MAX_OIDC_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_EXCHANGE_REQUEST_BYTES: usize = 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeRequest {
+    repository: String,
+    permissions: Permissions,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubActionsClaims {
@@ -33,8 +41,9 @@ struct GitHubActionsClaims {
 
 #[derive(Debug, Clone)]
 struct VerifiedClaims {
-    repository: RepositoryFullName,
-    repository_id: RepositoryId,
+    target_repository: RepositoryFullName,
+    target_repository_id: RepositoryId,
+    permissions: Permissions,
     git_ref: GitRef,
     jti: Jti,
     expires_at_ms: u64,
@@ -66,6 +75,7 @@ async fn verify_oidc_claims(
     config: &Config,
     request: &Request,
 ) -> Result<VerifiedClaims, AppError> {
+    let exchange_request = get_exchange_request(request)?;
     let oidc_token = get_bearer_token(request).ok_or(AppError::MissingBearerToken)?;
 
     let header = decode_header(oidc_token).map_err(map_jwt_error)?;
@@ -139,7 +149,12 @@ async fn verify_oidc_claims(
         return Err(AppError::RepositoryIdNotAllowed);
     }
 
-    if claims.event_name.as_deref() != Some("workflow_dispatch") {
+    rules.retain(|rule| {
+        rule.allowed_events()
+            .iter()
+            .any(|event| claims.event_name.as_deref() == Some(event.as_str()))
+    });
+    if rules.is_empty() {
         return Err(AppError::EventNotAllowed);
     }
 
@@ -158,6 +173,23 @@ async fn verify_oidc_claims(
     });
     let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
 
+    match exchange_request.as_ref() {
+        Some(exchange_request) => {
+            let target = RepositoryFullName::try_from(exchange_request.repository.as_str())
+                .map_err(|_| AppError::InvalidExchangeRequest)?;
+            if target != *rule.target_repository() {
+                return Err(AppError::TargetRepositoryNotAllowed);
+            }
+            if !rule.permissions().permits(&exchange_request.permissions) {
+                return Err(AppError::PermissionsNotAllowed);
+            }
+        }
+        None if rule.has_target_repository() => {
+            return Err(AppError::TargetRepositoryNotAllowed);
+        }
+        None => {}
+    }
+
     let jti = claims
         .jti
         .ok_or(AppError::OidcTokenMissingJti)
@@ -165,8 +197,12 @@ async fn verify_oidc_claims(
     let exp = claims.exp.ok_or(AppError::OidcTokenMissingExp)?;
 
     Ok(VerifiedClaims {
-        repository,
-        repository_id,
+        target_repository: rule.target_repository().clone(),
+        target_repository_id: rule.target_repository_id(),
+        permissions: exchange_request.map_or_else(
+            || rule.permissions().clone(),
+            |request| request.permissions.clone(),
+        ),
         git_ref: rule.git_ref().clone(),
         jti,
         expires_at_ms: exp.saturating_mul(1000) + CLOCK_TOLERANCE_SECONDS.saturating_mul(1000),
@@ -182,8 +218,8 @@ async fn mint_installation_token(
         &config.http_client,
         &config.github_api_base,
         &app_jwt,
-        claims.repository.owner().as_str(),
-        claims.repository.repo().as_str(),
+        claims.target_repository.owner().as_str(),
+        claims.target_repository.repo().as_str(),
     )
     .await?;
 
@@ -192,14 +228,16 @@ async fn mint_installation_token(
         &config.github_api_base,
         &app_jwt,
         installation_id,
-        *claims.repository_id,
+        *claims.target_repository_id,
+        &claims.target_repository,
+        &claims.permissions,
     )
     .await?;
 
     Ok(ExchangeResult {
         token: token.token,
         expires_at: token.expires_at,
-        repository: claims.repository.as_str().to_string(),
+        repository: claims.target_repository.as_str().to_string(),
         git_ref: claims.git_ref.as_str().to_string(),
     })
 }
@@ -216,6 +254,23 @@ fn get_bearer_token(request: &Request) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn get_exchange_request(request: &Request) -> Result<Option<ExchangeRequest>, AppError> {
+    let body = match request.body() {
+        Body::Empty => return Ok(None),
+        Body::Text(body) => body.as_bytes(),
+        Body::Binary(body) => body.as_slice(),
+    };
+    if body.is_empty() {
+        return Ok(None);
+    }
+    if body.len() > MAX_EXCHANGE_REQUEST_BYTES {
+        return Err(AppError::InvalidExchangeRequest);
+    }
+    serde_json::from_slice(body)
+        .map(Some)
+        .map_err(|_| AppError::InvalidExchangeRequest)
 }
 
 fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
@@ -244,7 +299,7 @@ fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::get_bearer_token;
+    use super::{get_bearer_token, get_exchange_request, MAX_EXCHANGE_REQUEST_BYTES};
     use crate::github::{RepositoryFullName, RepositoryId};
     use lambda_http::{http::Request, Body};
 
@@ -337,6 +392,35 @@ mod tests {
             .unwrap();
         assert_eq!(get_bearer_token(&request), None);
     }
+
+    #[test]
+    fn exchange_request_accepts_empty_and_valid_bodies() {
+        let empty = Request::builder().body(Body::Empty).unwrap();
+        assert!(get_exchange_request(&empty).unwrap().is_none());
+
+        let valid = Request::builder()
+            .body(Body::Text(
+                r#"{"repository":"octo/tools","permissions":{"contents":"write"}}"#.into(),
+            ))
+            .unwrap();
+        assert!(get_exchange_request(&valid).unwrap().is_some());
+    }
+
+    #[test]
+    fn exchange_request_rejects_malformed_unknown_duplicate_and_oversized_bodies() {
+        for body in [
+            "not-json".to_string(),
+            r#"{"repository":"octo/tools"}"#.to_string(),
+            r#"{"repository":"octo/tools","permissions":{"contents":"write"},"extra":true}"#
+                .to_string(),
+            r#"{"repository":"octo/tools","permissions":{"contents":"write","contents":"read"}}"#
+                .to_string(),
+            "x".repeat(MAX_EXCHANGE_REQUEST_BYTES + 1),
+        ] {
+            let request = Request::builder().body(Body::Text(body)).unwrap();
+            assert!(get_exchange_request(&request).is_err());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +440,7 @@ mod integration_tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use wiremock::{
-        matchers::{method, path},
+        matchers::{body_json, method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -458,6 +542,23 @@ mod integration_tests {
                 .unwrap()
         }
 
+        fn make_scoped_request(
+            &self,
+            token: &str,
+            repository: &str,
+            permissions: serde_json::Value,
+        ) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::Text(
+                    json!({ "repository": repository, "permissions": permissions }).to_string(),
+                ))
+                .unwrap()
+        }
+
         fn build_config(&self, policy: Policy) -> Config {
             let http_client = reqwest::Client::builder().build().unwrap();
             let jwks_url = format!("{}/.well-known/jwks", self.server.uri());
@@ -495,7 +596,8 @@ mod integration_tests {
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
 
-        assert_eq!(verified.repository.as_str(), "octo/tools");
+        assert_eq!(verified.target_repository.as_str(), "octo/tools");
+        assert_eq!(*verified.target_repository_id, 42);
         assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
     }
 
@@ -534,8 +636,8 @@ mod integration_tests {
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
 
-        assert_eq!(verified.repository.as_str(), "octo/docs");
-        assert_eq!(*verified.repository_id, 43);
+        assert_eq!(verified.target_repository.as_str(), "octo/docs");
+        assert_eq!(*verified.target_repository_id, 43);
         assert_eq!(verified.git_ref.as_str(), "refs/tags/v1");
     }
 
@@ -583,7 +685,7 @@ mod integration_tests {
         let request = fixture.make_request(&token);
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
-        assert_eq!(verified.repository.as_str(), "octo/tools");
+        assert_eq!(verified.target_repository.as_str(), "octo/tools");
     }
 
     #[tokio::test]
@@ -708,6 +810,375 @@ mod integration_tests {
 
         let error = verify_oidc_claims(&config, &request).await.unwrap_err();
         assert!(matches!(error, AppError::EventNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_allowed_events_for_a_target_repository() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "permissions": { "contents": "write" },
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+
+        for event in ["push", "workflow_dispatch"] {
+            let mut claims = fixture.valid_claims();
+            claims["event_name"] = json!(event);
+            let token = fixture.sign_claims(claims);
+            let request = fixture.make_scoped_request(
+                &token,
+                "octo/tools-dev",
+                json!({ "contents": "write" }),
+            );
+
+            let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+            assert_eq!(verified.target_repository.as_str(), "octo/tools-dev");
+            assert_eq!(*verified.target_repository_id, 84);
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_the_uv_fork_sync_rule() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/sync-uv-dev.yml",
+                "environment": "automations",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "permissions": { "contents": "write" },
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+
+        for event in ["push", "workflow_dispatch"] {
+            let mut claims = fixture.valid_claims();
+            claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+            claims["repository"] = json!("astral-sh/uv");
+            claims["repository_id"] = json!(699532645);
+            claims["event_name"] = json!(event);
+            claims["workflow_ref"] =
+                json!("astral-sh/uv/.github/workflows/sync-uv-dev.yml@refs/heads/main");
+            claims["environment"] = json!("automations");
+            let token = fixture.sign_claims(claims);
+            let request = fixture.make_scoped_request(
+                &token,
+                "astral-sh/uv-dev",
+                json!({ "contents": "write" }),
+            );
+
+            let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+            assert_eq!(verified.target_repository.as_str(), "astral-sh/uv-dev");
+            assert_eq!(*verified.target_repository_id, 1302176231);
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_rejects_invalid_uv_fork_sync_claims() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/sync-uv-dev.yml",
+                "environment": "automations",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut valid_claims = fixture.valid_claims();
+        valid_claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+        valid_claims["repository"] = json!("astral-sh/uv");
+        valid_claims["repository_id"] = json!(699532645);
+        valid_claims["event_name"] = json!("push");
+        valid_claims["workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/sync-uv-dev.yml@refs/heads/main");
+        valid_claims["environment"] = json!("automations");
+
+        for (field, value, expected_code) in [
+            (
+                "sub",
+                json!("repo:astral-sh/uv-dev:environment:automations"),
+                "subject_not_allowed",
+            ),
+            (
+                "repository",
+                json!("astral-sh/uv-dev"),
+                "repository_not_allowed",
+            ),
+            (
+                "repository_id",
+                json!(1302176231),
+                "repository_id_not_allowed",
+            ),
+            ("ref", json!("refs/heads/other"), "ref_not_allowed"),
+            (
+                "workflow_ref",
+                json!("astral-sh/uv/.github/workflows/ci.yml@refs/heads/main"),
+                "workflow_not_allowed",
+            ),
+            ("environment", json!("release"), "environment_not_allowed"),
+            ("event_name", json!("pull_request"), "event_not_allowed"),
+        ] {
+            let mut claims = valid_claims.clone();
+            claims[field] = value;
+            let token = fixture.sign_claims(claims);
+            let request = fixture.make_scoped_request(
+                &token,
+                "astral-sh/uv-dev",
+                json!({ "contents": "write" }),
+            );
+
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+
+            assert_eq!(error.code(), expected_code, "field {field}");
+        }
+
+        let token = fixture.sign_claims(valid_claims);
+        let request =
+            fixture.make_scoped_request(&token, "astral-sh/uv", json!({ "contents": "write" }));
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert_eq!(error.code(), "target_repository_not_allowed");
+
+        let request = fixture.make_request(&token);
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+        assert_eq!(error.code(), "target_repository_not_allowed");
+
+        let read_request =
+            fixture.make_scoped_request(&token, "astral-sh/uv-dev", json!({ "contents": "read" }));
+        let verified = verify_oidc_claims(&config, &read_request).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(verified.permissions).unwrap(),
+            json!({ "contents": "read" })
+        );
+
+        for permissions in [
+            json!({ "actions": "write" }),
+            json!({ "contents": "write", "actions": "write" }),
+        ] {
+            let request = fixture.make_scoped_request(&token, "astral-sh/uv-dev", permissions);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert_eq!(error.code(), "permissions_not_allowed");
+        }
+
+        for permissions in [json!({ "contents": "admin" }), json!({ "members": "read" })] {
+            let request = fixture.make_scoped_request(&token, "astral-sh/uv-dev", permissions);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert_eq!(error.code(), "invalid_exchange_request");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_does_not_mix_events_or_targets_across_rules() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "allowed_events": ["workflow_dispatch"],
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84
+            }, {
+                "subject": "repo:octo/docs:environment:publish",
+                "repository": "octo/docs",
+                "repository_id": 43,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "publish",
+                "allowed_events": ["push"],
+                "target_repository": "octo/docs-dev",
+                "target_repository_id": 85
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["event_name"] = json!("push");
+        let token = fixture.sign_claims(claims);
+        let request =
+            fixture.make_scoped_request(&token, "octo/tools-dev", json!({ "contents": "write" }));
+
+        let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+
+        assert!(matches!(error, AppError::EventNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_does_not_mix_event_workflow_or_target_across_rules() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "allowed_events": ["workflow_dispatch"],
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84
+            }, {
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "release",
+                "allowed_events": ["push"],
+                "target_repository": "octo/docs-dev",
+                "target_repository_id": 85
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+
+        let mut mixed_claims = fixture.valid_claims();
+        mixed_claims["event_name"] = json!("push");
+        let mixed_token = fixture.sign_claims(mixed_claims);
+        let mixed_request = fixture.make_scoped_request(
+            &mixed_token,
+            "octo/docs-dev",
+            json!({ "contents": "write" }),
+        );
+
+        let error = verify_oidc_claims(&config, &mixed_request)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::WorkflowNotAllowed));
+
+        let mut publish_claims = fixture.valid_claims();
+        publish_claims["event_name"] = json!("push");
+        publish_claims["workflow_ref"] =
+            json!("octo/tools/.github/workflows/publish.yml@refs/heads/main");
+        let publish_token = fixture.sign_claims(publish_claims);
+        let publish_request = fixture.make_scoped_request(
+            &publish_token,
+            "octo/docs-dev",
+            json!({ "contents": "write" }),
+        );
+
+        let verified = verify_oidc_claims(&config, &publish_request).await.unwrap();
+        assert_eq!(verified.target_repository.as_str(), "octo/docs-dev");
+        assert_eq!(*verified.target_repository_id, 85);
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_does_not_mix_permissions_across_rules() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "allowed_events": ["workflow_dispatch"],
+                "permissions": { "contents": "read" },
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84
+            }, {
+                "subject": "repo:octo/docs:environment:publish",
+                "repository": "octo/docs",
+                "repository_id": 43,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "publish",
+                "allowed_events": ["workflow_dispatch"],
+                "permissions": { "contents": "write", "pull_requests": "write" },
+                "target_repository": "octo/docs-dev",
+                "target_repository_id": 85
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for permissions in [
+            json!({ "contents": "write" }),
+            json!({ "contents": "read", "pull_requests": "write" }),
+        ] {
+            let request = fixture.make_scoped_request(&token, "octo/tools-dev", permissions);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert!(matches!(error, AppError::PermissionsNotAllowed));
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_installation_token_uses_only_the_matched_target_repository() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.app_private_key = RSA_PRIVATE_KEY.try_into().unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools-dev/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 123 })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/app/installations/123/access_tokens"))
+            .and(body_json(json!({
+                "repository_ids": [84],
+                "permissions": { "contents": "write" }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "token": "ghs_target_only",
+                "expires_at": "2026-07-16T14:00:00Z",
+                "repositories": [{ "id": 84, "full_name": "octo/tools-dev" }]
+            })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+
+        let claims = VerifiedClaims {
+            target_repository: "octo/tools-dev".try_into().unwrap(),
+            target_repository_id: serde_json::from_value(json!(84)).unwrap(),
+            permissions: Permissions::contents_write(),
+            git_ref: "refs/heads/main".try_into().unwrap(),
+            jti: "test-jti".try_into().unwrap(),
+            expires_at_ms: 0,
+        };
+
+        let result = mint_installation_token(&config, &claims).await.unwrap();
+
+        assert_eq!(result.repository, "octo/tools-dev");
+        assert_eq!(result.git_ref, "refs/heads/main");
+        assert_eq!(result.token.as_str(), "ghs_target_only");
     }
 
     #[tokio::test]
