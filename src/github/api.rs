@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use crate::error::AppError;
 
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com/";
+const TRUSTED_GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_REQUEST_MAX_ATTEMPTS: usize = 2;
 const GITHUB_REQUEST_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -52,7 +53,8 @@ impl TryFrom<String> for GithubApiBase {
 
         let mut url = reqwest::Url::parse(value).map_err(|_| AppError::InvalidGithubApiUrl)?;
         if url.scheme() != "https"
-            || url.host_str().is_none()
+            || url.host_str() != Some(TRUSTED_GITHUB_API_HOST)
+            || url.port().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -196,19 +198,19 @@ mod tests {
     use super::{github_api_url, retry_delay, send_github_request, GithubApiBase};
 
     #[test]
-    fn api_base_normalizes_enterprise_path_prefixes() {
-        let base = GithubApiBase::try_from("https://ghe.example.com/api/v3").unwrap();
+    fn api_base_normalizes_path_prefixes() {
+        let base = GithubApiBase::try_from("https://api.github.com/api/v3").unwrap();
         let url = github_api_url(&base, "repos/octo/tools").unwrap();
 
         assert_eq!(
             url.as_str(),
-            "https://ghe.example.com/api/v3/repos/octo/tools"
+            "https://api.github.com/api/v3/repos/octo/tools"
         );
     }
 
     #[test]
     fn api_base_requires_https() {
-        assert!(GithubApiBase::try_from("http://ghe.example.com/api/v3").is_err());
+        assert!(GithubApiBase::try_from("http://api.github.com/api/v3").is_err());
         assert!(GithubApiBase::try_from("http://127.0.0.1:8080/api/v3").is_err());
     }
 
@@ -226,10 +228,21 @@ mod tests {
     #[test]
     fn api_base_rejects_credentials_queries_and_fragments() {
         for value in [
-            "https://token@ghe.example.com/api/v3",
-            "https://user:token@ghe.example.com/api/v3",
-            "https://ghe.example.com/api/v3?token=secret",
-            "https://ghe.example.com/api/v3#token=secret",
+            "https://token@api.github.com/api/v3",
+            "https://user:token@api.github.com/api/v3",
+            "https://api.github.com/api/v3?token=secret",
+            "https://api.github.com/api/v3#token=secret",
+        ] {
+            assert!(GithubApiBase::try_from(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn api_base_rejects_untrusted_hosts_and_ports() {
+        for value in [
+            "https://attacker.example/api/v3",
+            "https://api.github.com.attacker.example/api/v3",
+            "https://api.github.com:8443/api/v3",
         ] {
             assert!(GithubApiBase::try_from(value).is_err(), "{value}");
         }
