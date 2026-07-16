@@ -93,7 +93,7 @@ The exchange succeeds only when all of these checks pass:
 1. The reusable workflow, if one is used
 
 `expected_audience` and a non-empty `rules` list are required. `allowed_events` can contain only
-`push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
+`issues`, `push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,
@@ -158,6 +158,28 @@ A reusable security-review publisher that is called by CI on pull requests can b
 
 This rule binds both the CI caller and the reusable publisher and issues only pull-request write
 access for `astral-sh/uv`.
+
+A reusable bug-reproduction workflow called by issue triage can allow both issue and manual
+triggers while keeping the caller and callee paths distinct:
+
+```json
+{
+  "subject": "repo:astral-sh/uv:environment:automations",
+  "repository": "astral-sh/uv",
+  "repository_id": 699532645,
+  "ref": "refs/heads/main",
+  "workflow_path": ".github/workflows/issue-triage.yml",
+  "job_workflow_path": ".github/workflows/reproduce-bug.yml",
+  "environment": "automations",
+  "allowed_events": ["issues", "workflow_dispatch"],
+  "permissions": { "contents": "write", "pull_requests": "write" },
+  "target_repository": "astral-sh/uv-dev",
+  "target_repository_id": 1302176231
+}
+```
+
+The callee path is required for this rule, so `issue-triage.yml` cannot use a different reusable
+workflow to exchange for the `astral-sh/uv-dev` token.
 
 `subject` must exactly match the OIDC subject emitted by the calling job. The default subject format
 for an environment-bound job is `repo:OWNER/REPO:environment:ENVIRONMENT`. Always bind the
