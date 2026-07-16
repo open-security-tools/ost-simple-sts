@@ -35,6 +35,7 @@ runs:
         set -euo pipefail
 
         node "$GITHUB_ACTION_PATH/scripts/validate-exchange-url.js" "$EXCHANGE_URL" "$OIDC_AUDIENCE"
+        source "$GITHUB_ACTION_PATH/scripts/action-values.sh"
 
         if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
           echo "id-token: write is required to request a GitHub OIDC token" >&2
@@ -45,19 +46,19 @@ runs:
         oidc_response=$(curl --silent --show-error --fail \
           --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}")
-        oidc_token=$(jq --exit-status --raw-output '.value | select(type == "string" and length > 0)' <<<"$oidc_response")
-        echo "::add-mask::$oidc_token"
+        oidc_token=$(read_action_string value <<<"$oidc_response")
+        mask_action_value "$oidc_token"
 
         response=$(curl --silent --show-error --fail \
           --request POST \
           --header "Authorization: Bearer $oidc_token" \
           --data '' \
           "$EXCHANGE_URL")
-        token=$(jq --exit-status --raw-output '.token | select(type == "string" and length > 0)' <<<"$response")
-        expires_at=$(jq --exit-status --raw-output '.expires_at | select(type == "string" and length > 0)' <<<"$response")
-        repository=$(jq --exit-status --raw-output '.repository | select(type == "string" and length > 0)' <<<"$response")
-        git_ref=$(jq --exit-status --raw-output '.ref | select(type == "string" and length > 0)' <<<"$response")
-        echo "::add-mask::$token"
+        token=$(read_action_string token <<<"$response")
+        expires_at=$(read_action_string expires_at <<<"$response")
+        repository=$(read_action_string repository <<<"$response")
+        git_ref=$(read_action_string ref <<<"$response")
+        mask_action_value "$token"
 
         {
           echo "token=$token"
