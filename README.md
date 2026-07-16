@@ -93,13 +93,18 @@ The exchange succeeds only when all of these checks pass:
 1. The reusable workflow, if one is used
 
 `expected_audience` and a non-empty `rules` list are required. `allowed_events` can contain only
-`push` and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
+`push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,
-`target_repository`, and `target_repository_id` are optional; the two target fields must either
-both be present or both be omitted. All other rule fields are required, unknown fields and duplicate
-permissions are rejected, and values from different rules are never combined.
+`job_workflow_path`, `target_repository`, and `target_repository_id` are optional; the two target
+fields must either both be present or both be omitted. All other rule fields are required, unknown
+fields and duplicate permissions are rejected, and values from different rules are never combined.
+
+For `pull_request` runs, set `ref` to `refs/pull/*/merge` to match only canonical pull-request merge
+refs. This pattern is valid only with `allowed_events: ["pull_request"]`. `workflow_path` always
+binds the calling workflow's `workflow_ref`; set `job_workflow_path` when the token is requested by
+a reusable workflow so its `job_workflow_ref` must match as well.
 
 A workflow in one repository can be allowed to update a different repository without granting the
 caller access. For example, an upstream fork-sync workflow can receive a token scoped only to the
@@ -132,6 +137,27 @@ The scalar spelling `permissions: contents:write` is also accepted for a single 
 is installed on `astral-sh/uv-dev`, and the returned token has `contents: write` only for that
 repository. The `repository` action output reports the target repository. A cross-repository rule
 requires an explicit matching request; it cannot be exchanged using the legacy empty request.
+
+A reusable security-review publisher that is called by CI on pull requests can be scoped separately:
+
+```json
+{
+  "subject": "repo:astral-sh/uv:environment:automations",
+  "repository": "astral-sh/uv",
+  "repository_id": 699532645,
+  "ref": "refs/pull/*/merge",
+  "workflow_path": ".github/workflows/ci.yml",
+  "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+  "environment": "automations",
+  "allowed_events": ["pull_request"],
+  "permissions": { "pull_requests": "write" },
+  "target_repository": "astral-sh/uv",
+  "target_repository_id": 699532645
+}
+```
+
+This rule binds both the CI caller and the reusable publisher and issues only pull-request write
+access for `astral-sh/uv`.
 
 `subject` must exactly match the OIDC subject emitted by the calling job. The default subject format
 for an environment-bound job is `repo:OWNER/REPO:environment:ENVIRONMENT`. Always bind the
