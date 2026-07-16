@@ -212,7 +212,7 @@ mod tests {
 
         let id = find_installation(
             &reqwest::Client::new(),
-            &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+            &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             "octo",
             "tools",
@@ -241,7 +241,7 @@ mod tests {
 
         let id = find_installation(
             &reqwest::Client::new(),
-            &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+            &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             "octo",
             "tools",
@@ -263,7 +263,7 @@ mod tests {
 
         let error = find_installation(
             &reqwest::Client::new(),
-            &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+            &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             "octo",
             "tools",
@@ -293,7 +293,7 @@ mod tests {
 
         let token = mint_installation_token(
             &reqwest::Client::new(),
-            &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+            &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             123,
             42,
@@ -316,7 +316,7 @@ mod tests {
 
         let error = mint_installation_token(
             &reqwest::Client::new(),
-            &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+            &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             123,
             42,
@@ -346,7 +346,7 @@ mod tests {
 
             let error = mint_installation_token(
                 &reqwest::Client::new(),
-                &GithubApiBase::try_from(server.uri().as_str()).unwrap(),
+                &GithubApiBase::for_test(server.uri().as_str()),
                 "app-jwt",
                 999,
                 1,

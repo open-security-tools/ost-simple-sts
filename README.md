@@ -37,12 +37,16 @@ jobs:
       - uses: actions/checkout@<commit-sha>
         with:
           token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
-The exchange action requires an HTTPS exchange URL and masks both the OIDC token and the returned
-installation token. It exposes `token`, `expires-at`, `repository`, and `ref` outputs. Pin actions
-to a commit SHA in production.
+The exchange action requires `exchange-url` to be the configured HTTPS `audience` URL followed by
+`/exchange`. This prevents a misleading or attacker-controlled endpoint from receiving the OIDC
+token. Set the policy `expected_audience` to that base URL; non-URL audiences are not supported by
+the bundled action. The action masks both the OIDC token and the returned installation token and
+exposes `token`, `expires-at`, `repository`, and `ref` outputs. Pin actions to a commit SHA in
+production.
 
 ## GitHub App
 
@@ -121,7 +125,9 @@ Requests to the following GitHub routes are expected:
 
 The installation lookup retries transient failures and secondary rate limits once with bounded
 backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
-keys and installation tokens are redacted from debug output.
+keys and installation tokens are redacted from debug output. Outbound requests require HTTPS and
+never follow redirects, so credentials and token-request payloads cannot be forwarded to an
+unexpected destination.
 
 Errors return a stable machine-readable code and a human-readable message:
 
