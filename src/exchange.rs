@@ -423,7 +423,7 @@ mod integration_tests {
         }
 
         fn base_url(&self) -> GithubApiBase {
-            GithubApiBase::try_from(self.server.uri().as_str()).unwrap()
+            GithubApiBase::for_test(self.server.uri().as_str())
         }
 
         fn policy(&self) -> Policy {
