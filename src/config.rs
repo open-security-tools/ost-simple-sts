@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::{
     error::AppError,
-    github::{GithubApiBase, RepositoryFullName, RepositoryId},
+    github::{GithubApiBase, Permissions, RepositoryFullName, RepositoryId},
     jwks::JwksCache,
 };
 
@@ -32,6 +32,15 @@ pub struct PolicyRule {
     git_ref: GitRef,
     workflow_path: WorkflowPath,
     environment: Option<EnvironmentName>,
+    allowed_events: Vec<EventName>,
+    permissions: Permissions,
+    target: Option<RepositoryTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct RepositoryTarget {
+    repository: RepositoryFullName,
+    repository_id: RepositoryId,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +61,14 @@ struct RawPolicyRule {
     workflow_path: String,
     #[serde(default)]
     environment: Option<String>,
+    #[serde(default = "default_allowed_events")]
+    allowed_events: Vec<String>,
+    #[serde(default)]
+    permissions: Option<Permissions>,
+    #[serde(default)]
+    target_repository: Option<String>,
+    #[serde(default)]
+    target_repository_id: Option<RepositoryId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +85,9 @@ pub struct WorkflowPath(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentName(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventName(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppId(String);
@@ -94,6 +114,14 @@ fn is_valid_workflow_path(value: &str) -> bool {
         && (value.ends_with(".yml") || value.ends_with(".yaml"))
 }
 
+fn is_valid_event_name(value: &str) -> bool {
+    matches!(value, "push" | "workflow_dispatch")
+}
+
+fn default_allowed_events() -> Vec<String> {
+    vec!["workflow_dispatch".to_string()]
+}
+
 crate::impl_string_newtype!(Audience, AppError, AppError::InvalidPolicy);
 crate::impl_string_newtype!(Subject, AppError, AppError::InvalidPolicy);
 crate::impl_string_newtype!(
@@ -109,6 +137,12 @@ crate::impl_string_newtype!(
     validate = is_valid_workflow_path
 );
 crate::impl_string_newtype!(EnvironmentName, AppError, AppError::InvalidPolicy);
+crate::impl_string_newtype!(
+    EventName,
+    AppError,
+    AppError::InvalidPolicy,
+    validate = is_valid_event_name
+);
 crate::impl_string_newtype!(AppId, AppError, AppError::AppIdNotConfigured);
 crate::impl_string_newtype!(JtiTableName, AppError, AppError::JtiTableNotConfigured);
 
@@ -191,6 +225,30 @@ impl PolicyRule {
     pub fn environment(&self) -> Option<&EnvironmentName> {
         self.environment.as_ref()
     }
+
+    pub fn allowed_events(&self) -> &[EventName] {
+        &self.allowed_events
+    }
+
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
+    }
+
+    pub fn target_repository(&self) -> &RepositoryFullName {
+        self.target
+            .as_ref()
+            .map_or(&self.repository, |target| &target.repository)
+    }
+
+    pub fn target_repository_id(&self) -> RepositoryId {
+        self.target
+            .as_ref()
+            .map_or(self.repository_id, |target| target.repository_id)
+    }
+
+    pub fn has_target_repository(&self) -> bool {
+        self.target.is_some()
+    }
 }
 
 impl std::str::FromStr for Policy {
@@ -225,6 +283,24 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
     type Error = AppError;
 
     fn try_from(raw: RawPolicyRule) -> Result<Self, Self::Error> {
+        let allowed_events = raw
+            .allowed_events
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed_events.is_empty() {
+            return Err(AppError::InvalidPolicy);
+        }
+
+        let target = match (raw.target_repository, raw.target_repository_id) {
+            (Some(repository), Some(repository_id)) => Some(RepositoryTarget {
+                repository: repository.try_into().map_err(|_| AppError::InvalidPolicy)?,
+                repository_id,
+            }),
+            (None, None) => None,
+            _ => return Err(AppError::InvalidPolicy),
+        };
+
         Ok(Self {
             subject: raw.subject.try_into()?,
             repository: raw
@@ -235,6 +311,9 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             git_ref: raw.git_ref.try_into()?,
             workflow_path: raw.workflow_path.try_into()?,
             environment: raw.environment.map(TryInto::try_into).transpose()?,
+            allowed_events,
+            permissions: raw.permissions.unwrap_or_else(Permissions::contents_write),
+            target,
         })
     }
 }
@@ -375,7 +454,11 @@ mod tests {
                 "repository": "octo/docs",
                 "repository_id": 43,
                 "ref": "refs/tags/v1",
-                "workflow_path": ".github/workflows/publish.yml"
+                "workflow_path": ".github/workflows/publish.yml",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "permissions": { "contents": "write", "pull_requests": "read" },
+                "target_repository": "octo/docs-preview",
+                "target_repository_id": 44
             }]
         }))
         .unwrap();
@@ -395,8 +478,28 @@ mod tests {
             ".github/workflows/release.yml"
         );
         assert_eq!(rule.environment().unwrap().as_str(), "release");
+        assert_eq!(rule.allowed_events()[0].as_str(), "workflow_dispatch");
+        assert_eq!(rule.target_repository().as_str(), "octo/tools");
+        assert_eq!(*rule.target_repository_id(), 42);
         assert_eq!(policy.rules()[1].repository().as_str(), "octo/docs");
         assert!(policy.rules()[1].environment().is_none());
+        assert_eq!(
+            policy.rules()[1]
+                .allowed_events()
+                .iter()
+                .map(|event| event.as_str())
+                .collect::<Vec<_>>(),
+            ["push", "workflow_dispatch"]
+        );
+        assert_eq!(
+            policy.rules()[1].target_repository().as_str(),
+            "octo/docs-preview"
+        );
+        assert_eq!(*policy.rules()[1].target_repository_id(), 44);
+        assert_eq!(
+            serde_json::to_value(policy.rules()[1].permissions()).unwrap(),
+            json!({ "contents": "write", "pull_requests": "read" })
+        );
     }
 
     #[test]
@@ -469,6 +572,58 @@ mod tests {
                     "ref": "refs/heads/main",
                     "workflow_path": ".github/workflows/release.yml"
                 }]
+            }));
+
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn policy_rejects_invalid_event_allowlists() {
+        for allowed_events in [
+            json!([]),
+            json!([""]),
+            json!(["pull_request"]),
+            json!(["push", "pull_request_target"]),
+        ] {
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [{
+                    "subject": "repo:octo/tools:ref:refs/heads/main",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "allowed_events": allowed_events
+                }]
+            }));
+
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn policy_rejects_incomplete_or_invalid_target_identity() {
+        for target in [
+            json!({ "target_repository": "octo/docs" }),
+            json!({ "target_repository_id": 43 }),
+            json!({ "target_repository": "octo", "target_repository_id": 43 }),
+            json!({ "target_repository": "octo/docs", "target_repository_id": 0 }),
+        ] {
+            let mut rule = json!({
+                "subject": "repo:octo/tools:ref:refs/heads/main",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml"
+            });
+            rule.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [rule]
             }));
 
             assert!(result.is_err());

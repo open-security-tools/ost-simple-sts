@@ -7,6 +7,8 @@
       "repository_id": 789012,
       "ref": "refs/heads/main",
       "workflow_path": ".github/workflows/release.yml",
+      "allowed_events": ["workflow_dispatch"],
+      "permissions": { "contents": "write" },
       "environment": "release"
     }
   ]

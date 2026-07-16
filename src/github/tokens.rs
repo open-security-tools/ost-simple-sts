@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::api::{github_api_url, github_request, send_github_request, GithubApiBase};
+use super::{Permissions, RepositoryFullName};
 use crate::error::AppError;
 
 /// Wraps a sensitive GitHub access token while redacting debug and display output.
@@ -19,6 +20,13 @@ pub struct Token(String);
 pub struct InstallationToken {
     pub token: Token,
     pub expires_at: String,
+    repositories: Vec<GrantedRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrantedRepository {
+    id: u64,
+    full_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +149,8 @@ pub async fn mint_installation_token(
     app_jwt: &str,
     installation_id: u64,
     repository_id: u64,
+    repository: &RepositoryFullName,
+    permissions: &Permissions,
 ) -> Result<InstallationToken, AppError> {
     let url = github_api_url(
         github_api_base,
@@ -148,7 +158,7 @@ pub async fn mint_installation_token(
     )?;
     let payload = json!({
         "repository_ids": [repository_id],
-        "permissions": { "contents": "write" },
+        "permissions": permissions,
     });
 
     let response = github_request(http_client.post(url), app_jwt)
@@ -161,10 +171,23 @@ pub async fn mint_installation_token(
         })?;
 
     match response.status().as_u16() {
-        201 => response.json::<InstallationToken>().await.map_err(|error| {
-            tracing::error!(?error, "failed to decode installation token response");
-            AppError::GithubAccessTokenRequestFailed
-        }),
+        201 => {
+            let token = response
+                .json::<InstallationToken>()
+                .await
+                .map_err(|error| {
+                    tracing::error!(?error, "failed to decode installation token response");
+                    AppError::GithubAccessTokenRequestFailed
+                })?;
+            if token.repositories.len() != 1
+                || token.repositories[0].id != repository_id
+                || token.repositories[0].full_name != repository.as_str()
+            {
+                tracing::error!("github returned an unexpectedly scoped installation token");
+                return Err(AppError::InstallationTokenRequestInvalid);
+            }
+            Ok(token)
+        }
         401 => Err(AppError::GithubAppAuthInvalid),
         403 => Err(AppError::GithubAccessTokenRequestForbidden),
         404 => Err(AppError::InstallationNotFound),
@@ -185,7 +208,10 @@ mod tests {
     };
 
     use super::{find_installation, mint_installation_token, Token};
-    use crate::{error::AppError, github::GithubApiBase};
+    use crate::{
+        error::AppError,
+        github::{GithubApiBase, Permissions, RepositoryFullName},
+    };
 
     #[test]
     fn token_debug_and_display_are_redacted() {
@@ -281,11 +307,12 @@ mod tests {
             .and(header("authorization", "Bearer app-jwt"))
             .and(body_json(json!({
                 "repository_ids": [42],
-                "permissions": { "contents": "write" }
+                "permissions": { "contents": "write", "pull_requests": "read" }
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_test123",
-                "expires_at": "2026-03-28T00:00:00Z"
+                "expires_at": "2026-03-28T00:00:00Z",
+                "repositories": [{ "id": 42, "full_name": "octo/tools" }]
             })))
             .expect(1)
             .mount(&server)
@@ -297,6 +324,9 @@ mod tests {
             "app-jwt",
             123,
             42,
+            &RepositoryFullName::try_from("octo/tools").unwrap(),
+            &serde_json::from_value(json!({ "contents": "write", "pull_requests": "read" }))
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -320,6 +350,8 @@ mod tests {
             "app-jwt",
             123,
             42,
+            &RepositoryFullName::try_from("octo/tools").unwrap(),
+            &Permissions::contents_write(),
         )
         .await
         .unwrap_err();
@@ -350,10 +382,52 @@ mod tests {
                 "app-jwt",
                 999,
                 1,
+                &RepositoryFullName::try_from("octo/tools").unwrap(),
+                &Permissions::contents_write(),
             )
             .await
             .unwrap_err();
             assert!(format!("{error:?}").contains(expected));
+            server.reset().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unexpectedly_scoped_installation_token() {
+        let server = MockServer::start().await;
+        let target = RepositoryFullName::try_from("octo/tools").unwrap();
+
+        for repositories in [
+            json!([]),
+            json!([{ "id": 43, "full_name": "octo/tools" }]),
+            json!([{ "id": 42, "full_name": "octo/other" }]),
+            json!([
+                { "id": 42, "full_name": "octo/tools" },
+                { "id": 43, "full_name": "octo/other" }
+            ]),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/app/installations/123/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "token": "ghs_test123",
+                    "expires_at": "2026-03-28T00:00:00Z",
+                    "repositories": repositories
+                })))
+                .mount(&server)
+                .await;
+
+            let error = mint_installation_token(
+                &reqwest::Client::new(),
+                &GithubApiBase::for_test(server.uri().as_str()),
+                "app-jwt",
+                123,
+                42,
+                &target,
+                &Permissions::contents_write(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::InstallationTokenRequestInvalid));
             server.reset().await;
         }
     }

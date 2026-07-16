@@ -44,7 +44,7 @@ pub enum AppError {
     RepositoryClaimInvalid,
     #[error("repository is not allowed")]
     RepositoryNotAllowed,
-    #[error("only workflow_dispatch events are allowed")]
+    #[error("event is not allowed")]
     EventNotAllowed,
     #[error("workflow is not allowed")]
     WorkflowNotAllowed,
@@ -52,6 +52,12 @@ pub enum AppError {
     RepositoryIdClaimInvalid,
     #[error("repository_id is not allowed")]
     RepositoryIdNotAllowed,
+    #[error("exchange request is invalid")]
+    InvalidExchangeRequest,
+    #[error("target repository is not allowed")]
+    TargetRepositoryNotAllowed,
+    #[error("requested permissions are not allowed")]
+    PermissionsNotAllowed,
     #[error("github app authentication failed")]
     GithubAppAuthInvalid,
     #[error("github rejected installation lookup")]
@@ -98,6 +104,9 @@ impl AppError {
             Self::WorkflowNotAllowed => "workflow_not_allowed",
             Self::RepositoryIdClaimInvalid => "repository_id_claim_invalid",
             Self::RepositoryIdNotAllowed => "repository_id_not_allowed",
+            Self::InvalidExchangeRequest => "invalid_exchange_request",
+            Self::TargetRepositoryNotAllowed => "target_repository_not_allowed",
+            Self::PermissionsNotAllowed => "permissions_not_allowed",
             Self::GithubAppAuthInvalid => "github_app_auth_invalid",
             Self::GithubInstallationLookupForbidden => "github_installation_lookup_forbidden",
             Self::AppNotInstalled => "app_not_installed",
@@ -137,6 +146,8 @@ impl AppError {
             | Self::WorkflowNotAllowed
             | Self::RepositoryIdClaimInvalid
             | Self::RepositoryIdNotAllowed
+            | Self::TargetRepositoryNotAllowed
+            | Self::PermissionsNotAllowed
             | Self::AppNotInstalled
             | Self::InstallationNotFound => StatusCode::FORBIDDEN,
             Self::GithubAppAuthInvalid
@@ -146,6 +157,7 @@ impl AppError {
                 StatusCode::BAD_GATEWAY
             }
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::InvalidExchangeRequest => StatusCode::BAD_REQUEST,
         }
     }
 }
