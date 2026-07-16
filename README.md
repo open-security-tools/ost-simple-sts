@@ -142,9 +142,10 @@ OIDC replay protection. The Lambda has permission to write replay records, read 
 Parameter Store, and read only the named App private key from Secrets Manager. The public API is
 limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
 Metadata-only HTTP access logs and Lambda logs are retained for 30 days. The stack creates alarms
-for Lambda errors and throttles, API 5xx responses, and sustained API 4xx spikes; set the optional
-`AlarmTopicArn` parameter to an SNS topic to receive notifications. Access logs deliberately omit
-request headers, OIDC claims, and response bodies.
+for Lambda errors and throttles, API 5xx responses, GitHub App dependency failures (HTTP 422 and
+424), and sustained API 4xx spikes; set the optional `AlarmTopicArn` parameter to an SNS topic to
+receive notifications. Access logs deliberately omit request headers, OIDC claims, and response
+bodies.
 
 Create the local configuration, set the App ID and private-key location in `.env`, and edit the
 policy for the calling repositories:
