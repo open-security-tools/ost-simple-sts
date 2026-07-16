@@ -202,15 +202,13 @@ mod tests {
         let error = cache
             .decoding_key_for("missing-kid")
             .await
-            .err()
-            .expect("expected missing kid to fail");
+            .expect_err("expected missing kid to fail");
         assert!(matches!(error, AppError::InvalidOidcToken));
 
         let error = cache
             .decoding_key_for("another-missing-kid")
             .await
-            .err()
-            .expect("expected missing kid to fail");
+            .expect_err("expected missing kid to fail");
         assert!(matches!(error, AppError::InvalidOidcToken));
 
         cache.decoding_key_for("known-kid").await.unwrap();
@@ -293,15 +291,13 @@ mod tests {
         let error = cache
             .decoding_key_for("any-kid")
             .await
-            .err()
-            .expect("expected jwks fetch to fail");
+            .expect_err("expected jwks fetch to fail");
         assert!(matches!(error, AppError::OidcVerificationUnavailable));
 
         let error = cache
             .decoding_key_for("another-kid")
             .await
-            .err()
-            .expect("expected failed refresh to be cooled down");
+            .expect_err("expected failed refresh to be cooled down");
         assert!(matches!(error, AppError::OidcVerificationUnavailable));
     }
 }

@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@<commit-sha>
         with:
           token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
@@ -124,7 +125,9 @@ Requests to the following GitHub routes are expected:
 
 The installation lookup retries transient failures and secondary rate limits once with bounded
 backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
-keys and installation tokens are redacted from debug output.
+keys and installation tokens are redacted from debug output. Outbound requests require HTTPS and
+never follow redirects, so credentials and token-request payloads cannot be forwarded to an
+unexpected destination.
 
 Errors return a stable machine-readable code and a human-readable message:
 
@@ -144,6 +147,10 @@ The included SAM template provisions one Lambda, one HTTP API, and one DynamoDB 
 OIDC replay protection. The Lambda has permission to write replay records, read the App ID from SSM
 Parameter Store, and read only the named App private key from Secrets Manager. The public API is
 limited to 100 requests per second with a burst of 200, and Lambda concurrency is capped at 100.
+Metadata-only HTTP access logs and Lambda logs are retained for 30 days. The stack creates alarms
+for Lambda errors and throttles, API 5xx responses, and sustained API 4xx spikes; set the optional
+`AlarmTopicArn` parameter to an SNS topic to receive notifications. Access logs deliberately omit
+request headers, OIDC claims, and response bodies.
 
 Create the local configuration, set the App ID and private-key location in `.env`, and edit the
 policy for the calling repositories:
@@ -158,9 +165,9 @@ make deploy
 ```
 
 `make deploy-secrets` stores the App ID and private key in AWS. `make deploy` compacts the local
-policy and deploys the SAM stack. `POLICY_FILE`, `STACK_NAME`, `APP_ID_PARAMETER`, and
-`JTI_TABLE_NAME` can be overridden in `.env`; `ENV_FILE=/path/to/.env make deploy` selects another
-environment file.
+policy and deploys the SAM stack. `POLICY_FILE`, `STACK_NAME`, `APP_ID_PARAMETER`,
+`JTI_TABLE_NAME`, and the optional `ALARM_TOPIC_ARN` can be overridden in `.env`;
+`ENV_FILE=/path/to/.env make deploy` selects another environment file.
 
 ## Development
 
