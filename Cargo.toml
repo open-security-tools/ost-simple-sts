@@ -10,7 +10,7 @@ aws-config = "1"
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
-jsonwebtoken = { version = "9", features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 lambda_http = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
