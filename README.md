@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@<commit-sha>
         with:
           token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
