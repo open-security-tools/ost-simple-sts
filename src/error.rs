@@ -56,6 +56,8 @@ pub enum AppError {
     InvalidExchangeRequest,
     #[error("target repository is not allowed")]
     TargetRepositoryNotAllowed,
+    #[error("target installation is not allowed")]
+    TargetInstallationNotAllowed,
     #[error("requested permissions are not allowed")]
     PermissionsNotAllowed,
     #[error("github app authentication failed")]
@@ -106,6 +108,7 @@ impl AppError {
             Self::RepositoryIdNotAllowed => "repository_id_not_allowed",
             Self::InvalidExchangeRequest => "invalid_exchange_request",
             Self::TargetRepositoryNotAllowed => "target_repository_not_allowed",
+            Self::TargetInstallationNotAllowed => "target_installation_not_allowed",
             Self::PermissionsNotAllowed => "permissions_not_allowed",
             Self::GithubAppAuthInvalid => "github_app_auth_invalid",
             Self::GithubInstallationLookupForbidden => "github_installation_lookup_forbidden",
@@ -147,6 +150,7 @@ impl AppError {
             | Self::RepositoryIdClaimInvalid
             | Self::RepositoryIdNotAllowed
             | Self::TargetRepositoryNotAllowed
+            | Self::TargetInstallationNotAllowed
             | Self::PermissionsNotAllowed
             | Self::AppNotInstalled
             | Self::InstallationNotFound => StatusCode::FORBIDDEN,

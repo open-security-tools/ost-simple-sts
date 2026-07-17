@@ -154,7 +154,7 @@ test("rejects a partial or unsupported scope before requesting an OIDC token", a
   );
   await assert.rejects(
     runMain({ env: environment({ INPUT_REPOSITORY: "" }), fetchImpl }),
-    /repository and permissions must be provided together/,
+    /repository or repositories and permissions must be provided together/,
   );
   await assert.rejects(
     runMain({ env: environment({ INPUT_PERMISSIONS: "members: read" }), fetchImpl }),
@@ -173,6 +173,129 @@ test("rejects a partial or unsupported scope before requesting an OIDC token", a
     /duplicate repository permission: contents/,
   );
   assert.equal(called, false);
+});
+
+test("sends newline-delimited target repositories as an exact multi-repository request", async () => {
+  const calls = [];
+  const { files, appendFile } = memoryFiles();
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      token: "installation-token",
+      expires_at: expiresAt,
+      repositories: ["astral-sh/uv", "astral-sh/uv-dev"],
+      ref: "refs/heads/main",
+    }),
+  ];
+
+  await runMain({
+    env: environment({
+      INPUT_REPOSITORY: "",
+      INPUT_REPOSITORIES: "astral-sh/uv\nastral-sh/uv-dev\n",
+      INPUT_PERMISSIONS: "contents: write\npull_requests: write",
+    }),
+    appendFile,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return responses.shift();
+    },
+    uuid: () => "test-delimiter",
+    write: () => {},
+  });
+
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    repositories: ["astral-sh/uv", "astral-sh/uv-dev"],
+    permissions: { contents: "write", pull_requests: "write" },
+  });
+  assert.match(
+    files.get("outputs"),
+    /repositories<<ghadelimiter_test-delimiter\nastral-sh\/uv\nastral-sh\/uv-dev\nghadelimiter_test-delimiter/,
+  );
+  assert.doesNotMatch(files.get("outputs"), /\nrepository<</);
+});
+
+test("rejects mixed, invalid, and duplicate multi-repository inputs before requesting OIDC", async () => {
+  let called = false;
+  const fetchImpl = async () => {
+    called = true;
+  };
+
+  await assert.rejects(
+    runMain({
+      env: environment({
+        INPUT_REPOSITORIES: "astral-sh/uv\nastral-sh/uv-dev",
+      }),
+      fetchImpl,
+    }),
+    /repository and repositories are mutually exclusive/,
+  );
+  await assert.rejects(
+    runMain({
+      env: environment({
+        INPUT_REPOSITORY: "",
+        INPUT_REPOSITORIES: "astral-sh/uv",
+      }),
+      fetchImpl,
+    }),
+    /repositories must contain at least two OWNER\/REPO entries/,
+  );
+  await assert.rejects(
+    runMain({
+      env: environment({
+        INPUT_REPOSITORY: "",
+        INPUT_REPOSITORIES: "astral-sh/uv\n../other",
+      }),
+      fetchImpl,
+    }),
+    /repositories must contain one OWNER\/REPO entry per line/,
+  );
+  await assert.rejects(
+    runMain({
+      env: environment({
+        INPUT_REPOSITORY: "",
+        INPUT_REPOSITORIES: "astral-sh/uv\nASTRAL-SH/UV",
+      }),
+      fetchImpl,
+    }),
+    /duplicate repository: ASTRAL-SH\/UV/,
+  );
+  assert.equal(called, false);
+});
+
+test("rejects an unexpected returned repository set while preserving revocation state", async () => {
+  for (const repositories of [
+    ["astral-sh/uv"],
+    ["astral-sh/uv", "astral-sh/other"],
+    ["astral-sh/uv", "astral-sh/uv", "astral-sh/uv-dev"],
+    ["astral-sh/uv", "astral-sh/uv"],
+  ]) {
+    const { files, appendFile } = memoryFiles();
+    const responses = [
+      response({ value: "oidc-token" }),
+      response({
+        token: "installation-token",
+        expires_at: expiresAt,
+        repositories,
+        ref: "refs/heads/main",
+      }),
+    ];
+
+    await assert.rejects(
+      runMain({
+        env: environment({
+          INPUT_REPOSITORY: "",
+          INPUT_REPOSITORIES: "astral-sh/uv\nastral-sh/uv-dev",
+        }),
+        appendFile,
+        fetchImpl: async () => responses.shift(),
+        uuid: () => "test-delimiter",
+        write: () => {},
+      }),
+      /returned repositories do not match the requested repositories/,
+    );
+    assert.match(files.get("state"), /token<<ghadelimiter_test-delimiter\ninstallation-token/);
+    assert.equal(files.has("outputs"), false);
+  }
 });
 
 test("sends multiple newline-delimited repository permissions as a JSON map", async () => {

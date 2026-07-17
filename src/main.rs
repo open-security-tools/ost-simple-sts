@@ -93,6 +93,7 @@ async fn handle_request(config: config::Config, request: Request) -> Result<AppR
                 result.token,
                 result.expires_at,
                 result.repository,
+                result.repositories,
                 result.git_ref,
             ))
         }

@@ -11,6 +11,9 @@ inputs:
   repository:
     description: Target repository requested from the simple-sts policy.
     required: false
+  repositories:
+    description: Newline-delimited target repositories requested from a multi-repository simple-sts policy rule.
+    required: false
   permissions:
     description: Newline-delimited GitHub App repository permissions requested from the simple-sts policy.
     required: false
@@ -22,6 +25,8 @@ outputs:
     description: Expiration time reported by GitHub.
   repository:
     description: Repository authorized by the exchange policy.
+  repositories:
+    description: Newline-delimited repositories authorized by a multi-repository exchange policy.
   ref:
     description: Git ref authorized by the exchange policy.
 

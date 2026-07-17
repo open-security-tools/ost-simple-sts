@@ -17,8 +17,18 @@ const MAX_EXCHANGE_REQUEST_BYTES: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawExchangeRequest {
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    repositories: Option<Vec<String>>,
+    permissions: Permissions,
+}
+
+#[derive(Debug)]
 struct ExchangeRequest {
-    repository: String,
+    repositories: Vec<RepositoryFullName>,
+    multiple: bool,
     permissions: Permissions,
 }
 
@@ -43,6 +53,9 @@ struct GitHubActionsClaims {
 struct VerifiedClaims {
     target_repository: RepositoryFullName,
     target_repository_id: RepositoryId,
+    target_repositories: Vec<(RepositoryFullName, RepositoryId)>,
+    target_installation_id: Option<u64>,
+    multiple_target_repositories: bool,
     permissions: Permissions,
     git_ref: GitRef,
     jti: Jti,
@@ -52,7 +65,8 @@ struct VerifiedClaims {
 pub struct ExchangeResult {
     pub token: github::Token,
     pub expires_at: String,
-    pub repository: String,
+    pub repository: Option<String>,
+    pub repositories: Option<Vec<String>>,
     pub git_ref: String,
 }
 
@@ -183,12 +197,19 @@ async fn verify_oidc_claims(
         )
     });
     let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
+    let target_repositories = rule.target_repositories();
 
     match exchange_request.as_ref() {
         Some(exchange_request) => {
-            let target = RepositoryFullName::try_from(exchange_request.repository.as_str())
-                .map_err(|_| AppError::InvalidExchangeRequest)?;
-            if target != *rule.target_repository() {
+            if exchange_request.multiple != rule.has_multiple_target_repositories()
+                || exchange_request.repositories.len() != target_repositories.len()
+                || !target_repositories.iter().all(|(target, _)| {
+                    exchange_request
+                        .repositories
+                        .iter()
+                        .any(|repository| repository == target)
+                })
+            {
                 return Err(AppError::TargetRepositoryNotAllowed);
             }
             if !rule.permissions().permits(&exchange_request.permissions) {
@@ -206,10 +227,17 @@ async fn verify_oidc_claims(
         .ok_or(AppError::OidcTokenMissingJti)
         .and_then(Jti::try_from)?;
     let exp = claims.exp.ok_or(AppError::OidcTokenMissingExp)?;
+    let (target_repository, target_repository_id) = target_repositories
+        .first()
+        .cloned()
+        .ok_or(AppError::TargetRepositoryNotAllowed)?;
 
     Ok(VerifiedClaims {
-        target_repository: rule.target_repository().clone(),
-        target_repository_id: rule.target_repository_id(),
+        target_repository,
+        target_repository_id,
+        target_repositories,
+        target_installation_id: rule.target_installation_id(),
+        multiple_target_repositories: rule.has_multiple_target_repositories(),
         permissions: exchange_request.map_or_else(
             || rule.permissions().clone(),
             |request| request.permissions.clone(),
@@ -225,30 +253,49 @@ async fn mint_installation_token(
     claims: &VerifiedClaims,
 ) -> Result<ExchangeResult, AppError> {
     let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
-    let installation_id = github::find_installation(
-        &config.http_client,
-        &config.github_api_base,
-        &app_jwt,
-        claims.target_repository.owner().as_str(),
-        claims.target_repository.repo().as_str(),
-    )
-    .await?;
+    let mut installation_id = claims.target_installation_id;
+    for (repository, _) in &claims.target_repositories {
+        let found = github::find_installation(
+            &config.http_client,
+            &config.github_api_base,
+            &app_jwt,
+            repository.owner().as_str(),
+            repository.repo().as_str(),
+        )
+        .await?;
+        if installation_id.is_some_and(|expected| expected != found) {
+            return Err(AppError::TargetInstallationNotAllowed);
+        }
+        installation_id = Some(found);
+    }
+    let installation_id = installation_id.ok_or(AppError::TargetInstallationNotAllowed)?;
 
     let token = github::mint_installation_token(
         &config.http_client,
         &config.github_api_base,
         &app_jwt,
         installation_id,
-        *claims.target_repository_id,
-        &claims.target_repository,
+        &claims.target_repositories,
         &claims.permissions,
     )
     .await?;
 
+    let repositories = claims
+        .target_repositories
+        .iter()
+        .map(|(repository, _)| repository.as_str().to_string())
+        .collect::<Vec<_>>();
+    debug_assert_eq!(
+        claims.target_repositories.first().map(|(_, id)| *id),
+        Some(claims.target_repository_id)
+    );
+
     Ok(ExchangeResult {
         token: token.token,
         expires_at: token.expires_at,
-        repository: claims.target_repository.as_str().to_string(),
+        repository: (!claims.multiple_target_repositories)
+            .then(|| claims.target_repository.as_str().to_string()),
+        repositories: claims.multiple_target_repositories.then_some(repositories),
         git_ref: claims.git_ref.as_str().to_string(),
     })
 }
@@ -279,9 +326,31 @@ fn get_exchange_request(request: &Request) -> Result<Option<ExchangeRequest>, Ap
     if body.len() > MAX_EXCHANGE_REQUEST_BYTES {
         return Err(AppError::InvalidExchangeRequest);
     }
-    serde_json::from_slice(body)
-        .map(Some)
-        .map_err(|_| AppError::InvalidExchangeRequest)
+    let request = serde_json::from_slice::<RawExchangeRequest>(body)
+        .map_err(|_| AppError::InvalidExchangeRequest)?;
+    let (repositories, multiple) = match (request.repository, request.repositories) {
+        (Some(repository), None) => (vec![repository], false),
+        (None, Some(repositories)) if repositories.len() >= 2 => (repositories, true),
+        _ => return Err(AppError::InvalidExchangeRequest),
+    };
+    let repositories = repositories
+        .into_iter()
+        .map(RepositoryFullName::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| AppError::InvalidExchangeRequest)?;
+    if repositories.iter().enumerate().any(|(index, repository)| {
+        repositories[..index]
+            .iter()
+            .any(|previous| previous.as_str().eq_ignore_ascii_case(repository.as_str()))
+    }) {
+        return Err(AppError::InvalidExchangeRequest);
+    }
+
+    Ok(Some(ExchangeRequest {
+        repositories,
+        multiple,
+        permissions: request.permissions,
+    }))
 }
 
 fn map_jwt_error(error: jsonwebtoken::errors::Error) -> AppError {
@@ -415,6 +484,16 @@ mod tests {
             ))
             .unwrap();
         assert!(get_exchange_request(&valid).unwrap().is_some());
+
+        let multiple = Request::builder()
+            .body(Body::Text(
+                r#"{"repositories":["octo/tools","octo/tools-dev"],"permissions":{"contents":"write"}}"#
+                    .into(),
+            ))
+            .unwrap();
+        let multiple = get_exchange_request(&multiple).unwrap().unwrap();
+        assert!(multiple.multiple);
+        assert_eq!(multiple.repositories.len(), 2);
     }
 
     #[test]
@@ -425,6 +504,14 @@ mod tests {
             r#"{"repository":"octo/tools","permissions":{"contents":"write"},"extra":true}"#
                 .to_string(),
             r#"{"repository":"octo/tools","permissions":{"contents":"write","contents":"read"}}"#
+                .to_string(),
+            r#"{"repository":"octo/tools","repositories":["octo/tools","octo/tools-dev"],"permissions":{"contents":"write"}}"#
+                .to_string(),
+            r#"{"repositories":[],"permissions":{"contents":"write"}}"#.to_string(),
+            r#"{"repositories":["octo/tools"],"permissions":{"contents":"write"}}"#.to_string(),
+            r#"{"repositories":["octo/tools","OCTO/TOOLS"],"permissions":{"contents":"write"}}"#
+                .to_string(),
+            r#"{"repositories":["octo/tools","../evil"],"permissions":{"contents":"write"}}"#
                 .to_string(),
             "x".repeat(MAX_EXCHANGE_REQUEST_BYTES + 1),
         ] {
@@ -566,6 +653,23 @@ mod integration_tests {
                 .header("content-type", "application/json")
                 .body(Body::Text(
                     json!({ "repository": repository, "permissions": permissions }).to_string(),
+                ))
+                .unwrap()
+        }
+
+        fn make_multi_scoped_request(
+            &self,
+            token: &str,
+            repositories: &[&str],
+            permissions: serde_json::Value,
+        ) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::Text(
+                    json!({ "repositories": repositories, "permissions": permissions }).to_string(),
                 ))
                 .unwrap()
         }
@@ -1536,6 +1640,12 @@ mod integration_tests {
         let claims = VerifiedClaims {
             target_repository: "octo/tools-dev".try_into().unwrap(),
             target_repository_id: serde_json::from_value(json!(84)).unwrap(),
+            target_repositories: vec![(
+                "octo/tools-dev".try_into().unwrap(),
+                serde_json::from_value(json!(84)).unwrap(),
+            )],
+            target_installation_id: None,
+            multiple_target_repositories: false,
             permissions: Permissions::contents_write(),
             git_ref: "refs/heads/main".try_into().unwrap(),
             jti: "test-jti".try_into().unwrap(),
@@ -1544,9 +1654,301 @@ mod integration_tests {
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
 
-        assert_eq!(result.repository, "octo/tools-dev");
+        assert_eq!(result.repository.as_deref(), Some("octo/tools-dev"));
+        assert!(result.repositories.is_none());
         assert_eq!(result.git_ref, "refs/heads/main");
         assert_eq!(result.token.as_str(), "ghs_target_only");
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_only_the_exact_multi_repository_target_set() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv-dev:environment:automations",
+                "repository": "astral-sh/uv-dev",
+                "repository_id": 1302176231,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/promote-pull-request.yml",
+                "environment": "automations",
+                "allowed_events": ["workflow_dispatch"],
+                "permissions": { "contents": "write", "pull_requests": "write" },
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:astral-sh/uv-dev:environment:automations");
+        claims["repository"] = json!("astral-sh/uv-dev");
+        claims["repository_id"] = json!(1302176231);
+        claims["workflow_ref"] =
+            json!("astral-sh/uv-dev/.github/workflows/promote-pull-request.yml@refs/heads/main");
+        claims["environment"] = json!("automations");
+        let token = fixture.sign_claims(claims.clone());
+
+        let request = fixture.make_multi_scoped_request(
+            &token,
+            &["astral-sh/uv-dev", "astral-sh/uv"],
+            json!({ "contents": "write", "pull_requests": "write" }),
+        );
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+        assert!(verified.multiple_target_repositories);
+        assert_eq!(verified.target_installation_id, Some(146796415));
+        assert_eq!(
+            verified
+                .target_repositories
+                .iter()
+                .map(|(repository, id)| (repository.as_str(), **id))
+                .collect::<Vec<_>>(),
+            [
+                ("astral-sh/uv", 699532645),
+                ("astral-sh/uv-dev", 1302176231)
+            ]
+        );
+
+        for repositories in [
+            vec!["astral-sh/uv"],
+            vec!["astral-sh/uv", "astral-sh/other"],
+            vec!["astral-sh/uv", "astral-sh/uv-dev", "astral-sh/other"],
+        ] {
+            let request = fixture.make_multi_scoped_request(
+                &token,
+                &repositories,
+                json!({ "contents": "write", "pull_requests": "write" }),
+            );
+            assert!(verify_oidc_claims(&config, &request).await.is_err());
+        }
+
+        let singular = fixture.make_scoped_request(
+            &token,
+            "astral-sh/uv",
+            json!({ "contents": "write", "pull_requests": "write" }),
+        );
+        assert!(matches!(
+            verify_oidc_claims(&config, &singular).await,
+            Err(AppError::TargetRepositoryNotAllowed)
+        ));
+        let broader = fixture.make_multi_scoped_request(
+            &token,
+            &["astral-sh/uv", "astral-sh/uv-dev"],
+            json!({ "contents": "write", "pull_requests": "write", "workflows": "write" }),
+        );
+        assert!(matches!(
+            verify_oidc_claims(&config, &broader).await,
+            Err(AppError::PermissionsNotAllowed)
+        ));
+
+        for (claim, value, expected) in [
+            (
+                "sub",
+                json!("repo:astral-sh/other:environment:automations"),
+                "subject_not_allowed",
+            ),
+            (
+                "repository",
+                json!("astral-sh/other"),
+                "repository_not_allowed",
+            ),
+            (
+                "repository_id",
+                json!(699532645),
+                "repository_id_not_allowed",
+            ),
+            ("ref", json!("refs/heads/other"), "ref_not_allowed"),
+            ("environment", json!("other"), "environment_not_allowed"),
+            ("event_name", json!("push"), "event_not_allowed"),
+            (
+                "workflow_ref",
+                json!("astral-sh/uv-dev/.github/workflows/other.yml@refs/heads/main"),
+                "workflow_not_allowed",
+            ),
+        ] {
+            let mut invalid_claims = claims.clone();
+            invalid_claims[claim] = value;
+            let token = fixture.sign_claims(invalid_claims);
+            let request = fixture.make_multi_scoped_request(
+                &token,
+                &["astral-sh/uv", "astral-sh/uv-dev"],
+                json!({ "contents": "write", "pull_requests": "write" }),
+            );
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert_eq!(error.code(), expected, "unexpected error for {claim}");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_does_not_mix_multi_repository_targets_across_rules() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "allowed_events": ["workflow_dispatch"],
+                "target_repositories": [
+                    { "repository": "octo/tools", "repository_id": 42 },
+                    { "repository": "octo/tools-dev", "repository_id": 84 }
+                ],
+                "target_installation_id": 123
+            }, {
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/publish.yml",
+                "environment": "release",
+                "allowed_events": ["push"],
+                "target_repositories": [
+                    { "repository": "octo/docs", "repository_id": 43 },
+                    { "repository": "octo/docs-dev", "repository_id": 85 }
+                ],
+                "target_installation_id": 123
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let token = fixture.sign_claims(fixture.valid_claims());
+        let mixed = fixture.make_multi_scoped_request(
+            &token,
+            &["octo/tools", "octo/docs-dev"],
+            json!({ "contents": "write" }),
+        );
+
+        assert!(matches!(
+            verify_oidc_claims(&config, &mixed).await,
+            Err(AppError::TargetRepositoryNotAllowed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mint_installation_token_uses_all_exact_targets_from_one_installation() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.app_private_key = RSA_PRIVATE_KEY.try_into().unwrap();
+
+        for path_suffix in [
+            "/repos/astral-sh/uv/installation",
+            "/repos/astral-sh/uv-dev/installation",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(path_suffix))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 146796415 })))
+                .expect(1)
+                .mount(&fixture.server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/app/installations/146796415/access_tokens"))
+            .and(body_json(json!({
+                "repository_ids": [699532645, 1302176231],
+                "permissions": { "contents": "write", "pull_requests": "write" }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "token": "ghs_multi_target",
+                "expires_at": "2026-07-16T14:00:00Z",
+                "repositories": [
+                    { "id": 1302176231, "full_name": "astral-sh/uv-dev" },
+                    { "id": 699532645, "full_name": "astral-sh/uv" }
+                ]
+            })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+
+        let claims = VerifiedClaims {
+            target_repository: "astral-sh/uv".try_into().unwrap(),
+            target_repository_id: serde_json::from_value(json!(699532645)).unwrap(),
+            target_repositories: vec![
+                (
+                    "astral-sh/uv".try_into().unwrap(),
+                    serde_json::from_value(json!(699532645)).unwrap(),
+                ),
+                (
+                    "astral-sh/uv-dev".try_into().unwrap(),
+                    serde_json::from_value(json!(1302176231)).unwrap(),
+                ),
+            ],
+            target_installation_id: Some(146796415),
+            multiple_target_repositories: true,
+            permissions: serde_json::from_value(
+                json!({ "contents": "write", "pull_requests": "write" }),
+            )
+            .unwrap(),
+            git_ref: "refs/heads/main".try_into().unwrap(),
+            jti: "test-jti".try_into().unwrap(),
+            expires_at_ms: 0,
+        };
+
+        let result = mint_installation_token(&config, &claims).await.unwrap();
+        assert!(result.repository.is_none());
+        assert_eq!(
+            result.repositories.as_deref(),
+            Some(["astral-sh/uv".to_string(), "astral-sh/uv-dev".to_string()].as_slice())
+        );
+        assert_eq!(result.token.as_str(), "ghs_multi_target");
+    }
+
+    #[tokio::test]
+    async fn mint_installation_token_rejects_a_wrong_target_installation() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.app_private_key = RSA_PRIVATE_KEY.try_into().unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/astral-sh/uv/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 146796415 })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/astral-sh/uv-dev/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 999 })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+
+        let claims = VerifiedClaims {
+            target_repository: "astral-sh/uv".try_into().unwrap(),
+            target_repository_id: serde_json::from_value(json!(699532645)).unwrap(),
+            target_repositories: vec![
+                (
+                    "astral-sh/uv".try_into().unwrap(),
+                    serde_json::from_value(json!(699532645)).unwrap(),
+                ),
+                (
+                    "astral-sh/uv-dev".try_into().unwrap(),
+                    serde_json::from_value(json!(1302176231)).unwrap(),
+                ),
+            ],
+            target_installation_id: Some(146796415),
+            multiple_target_repositories: true,
+            permissions: Permissions::contents_write(),
+            git_ref: "refs/heads/main".try_into().unwrap(),
+            jti: "test-jti".try_into().unwrap(),
+            expires_at_ms: 0,
+        };
+
+        assert!(matches!(
+            mint_installation_token(&config, &claims).await,
+            Err(AppError::TargetInstallationNotAllowed)
+        ));
+        assert!(fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method != "POST"));
     }
 
     #[tokio::test]
