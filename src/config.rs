@@ -32,6 +32,7 @@ pub struct PolicyRule {
     git_ref: GitRef,
     workflow_path: WorkflowPath,
     job_workflow_path: Option<WorkflowPath>,
+    job_workflow_ref: Option<JobWorkflowRef>,
     environment: Option<EnvironmentName>,
     allowed_events: Vec<EventName>,
     permissions: Permissions,
@@ -63,6 +64,8 @@ struct RawPolicyRule {
     #[serde(default)]
     job_workflow_path: Option<String>,
     #[serde(default)]
+    job_workflow_ref: Option<String>,
+    #[serde(default)]
     environment: Option<String>,
     #[serde(default = "default_allowed_events")]
     allowed_events: Vec<String>,
@@ -85,6 +88,9 @@ pub struct GitRef(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowPath(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobWorkflowRef(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvironmentName(String);
@@ -130,6 +136,22 @@ fn is_valid_workflow_path(value: &str) -> bool {
         && (value.ends_with(".yml") || value.ends_with(".yaml"))
 }
 
+fn is_valid_job_workflow_ref(value: &str) -> bool {
+    let Some((workflow, git_ref)) = value.rsplit_once('@') else {
+        return false;
+    };
+    let Some((repository, workflow_path)) = workflow.split_once("/.github/workflows/") else {
+        return false;
+    };
+
+    RepositoryFullName::try_from(repository).is_ok()
+        && is_valid_workflow_path(&format!("{WORKFLOWS_PREFIX}{workflow_path}"))
+        && is_valid_git_ref(git_ref)
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'*' | b'?' | b'[' | b']'))
+}
+
 fn is_valid_event_name(value: &str) -> bool {
     matches!(
         value,
@@ -154,6 +176,12 @@ crate::impl_string_newtype!(
     AppError,
     AppError::InvalidPolicy,
     validate = is_valid_workflow_path
+);
+crate::impl_string_newtype!(
+    JobWorkflowRef,
+    AppError,
+    AppError::InvalidPolicy,
+    validate = is_valid_job_workflow_ref
 );
 crate::impl_string_newtype!(EnvironmentName, AppError, AppError::InvalidPolicy);
 crate::impl_string_newtype!(
@@ -245,6 +273,10 @@ impl PolicyRule {
         self.job_workflow_path.as_ref()
     }
 
+    pub fn job_workflow_ref(&self) -> Option<&JobWorkflowRef> {
+        self.job_workflow_ref.as_ref()
+    }
+
     pub fn environment(&self) -> Option<&EnvironmentName> {
         self.environment.as_ref()
     }
@@ -331,16 +363,30 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             _ => return Err(AppError::InvalidPolicy),
         };
 
+        if raw.job_workflow_path.is_some() && raw.job_workflow_ref.is_some() {
+            return Err(AppError::InvalidPolicy);
+        }
+
+        let repository =
+            RepositoryFullName::try_from(raw.repository).map_err(|_| AppError::InvalidPolicy)?;
+        let job_workflow_ref = raw.job_workflow_ref.map(TryInto::try_into).transpose()?;
+        if job_workflow_ref
+            .as_ref()
+            .is_some_and(|workflow_ref: &JobWorkflowRef| {
+                !workflow_ref.as_str().starts_with(&format!("{repository}/"))
+            })
+        {
+            return Err(AppError::InvalidPolicy);
+        }
+
         Ok(Self {
             subject: raw.subject.try_into()?,
-            repository: raw
-                .repository
-                .try_into()
-                .map_err(|_| AppError::InvalidPolicy)?,
+            repository,
             repository_id: raw.repository_id,
             git_ref: raw.git_ref.try_into()?,
             workflow_path: raw.workflow_path.try_into()?,
             job_workflow_path: raw.job_workflow_path.map(TryInto::try_into).transpose()?,
+            job_workflow_ref,
             environment: raw.environment.map(TryInto::try_into).transpose()?,
             allowed_events,
             permissions: raw.permissions.unwrap_or_else(Permissions::contents_write),
@@ -595,6 +641,40 @@ mod tests {
     }
 
     #[test]
+    fn policy_accepts_an_exact_pull_request_job_workflow_ref() {
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:astral-sh/uv-dev:environment:automations",
+                "repository": "astral-sh/uv-dev",
+                "repository_id": 1302176231,
+                "ref": "refs/pull/*/merge",
+                "workflow_path": ".github/workflows/promote-pull-request-caller.yml",
+                "job_workflow_ref": "astral-sh/uv-dev/.github/workflows/promote-pull-request.yml@refs/heads/main",
+                "environment": "automations",
+                "allowed_events": ["pull_request"],
+                "permissions": { "contents": "write", "pull_requests": "write", "workflows": "write" },
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645
+            }]
+        }))
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(rule.git_ref().as_str(), "refs/pull/*/merge");
+        assert_eq!(
+            rule.workflow_path().as_str(),
+            ".github/workflows/promote-pull-request-caller.yml"
+        );
+        assert!(rule.job_workflow_path().is_none());
+        assert_eq!(
+            rule.job_workflow_ref().unwrap().as_str(),
+            "astral-sh/uv-dev/.github/workflows/promote-pull-request.yml@refs/heads/main"
+        );
+        assert_eq!(rule.allowed_events()[0].as_str(), "pull_request");
+    }
+
+    #[test]
     fn policy_accepts_an_issues_reusable_workflow_rule() {
         let policy: Policy = serde_json::from_value(json!({
             "expected_audience": "https://example.com",
@@ -766,6 +846,44 @@ mod tests {
             }));
 
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn policy_rejects_invalid_job_workflow_refs() {
+        for job_workflow in [
+            json!({ "job_workflow_ref": "" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/publish.yml" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/publish.yml@main" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/publish.yml@refs/heads/*" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/*.yml@refs/heads/main" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/publish?.yml@refs/heads/main" }),
+            json!({ "job_workflow_ref": "octo/tools/.github/workflows/publish.yml@refs/pull/*/merge" }),
+            json!({ "job_workflow_ref": "octo/other/.github/workflows/publish.yml@refs/heads/main" }),
+            json!({ "job_workflow_ref": "octo/tools/workflows/publish.yml@refs/heads/main" }),
+            json!({
+                "job_workflow_path": ".github/workflows/publish.yml",
+                "job_workflow_ref": "octo/tools/.github/workflows/publish.yml@refs/heads/main"
+            }),
+        ] {
+            let mut rule = json!({
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release"
+            });
+            rule.as_object_mut()
+                .unwrap()
+                .extend(job_workflow.as_object().unwrap().clone());
+
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [rule]
+            }));
+
+            assert!(result.is_err(), "job workflow {job_workflow}");
         }
     }
 

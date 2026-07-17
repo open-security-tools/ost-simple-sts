@@ -97,14 +97,18 @@ The exchange succeeds only when all of these checks pass:
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,
-`job_workflow_path`, `target_repository`, and `target_repository_id` are optional; the two target
-fields must either both be present or both be omitted. All other rule fields are required, unknown
-fields and duplicate permissions are rejected, and values from different rules are never combined.
+`job_workflow_path`, `job_workflow_ref`, `target_repository`, and `target_repository_id` are optional;
+the two target fields must either both be present or both be omitted. All other rule fields are
+required, unknown fields and duplicate permissions are rejected, and values from different rules are
+never combined.
 
 For `pull_request` runs, set `ref` to `refs/pull/*/merge` to match only canonical pull-request merge
 refs. This pattern is valid only with `allowed_events: ["pull_request"]`. `workflow_path` always
 binds the calling workflow's `workflow_ref`; set `job_workflow_path` when the token is requested by
-a reusable workflow so its `job_workflow_ref` must match as well.
+a reusable workflow at the caller's ref. To bind a trusted reusable workflow at a different ref,
+set `job_workflow_ref` to its exact `OWNER/REPO/.github/workflows/FILE@refs/heads/BRANCH` value.
+`job_workflow_path` and `job_workflow_ref` are mutually exclusive, and the exact ref cannot contain
+wildcards.
 
 See [`EXAMPLES.md`](./EXAMPLES.md) for cross-repository and reusable-workflow policy examples.
 
