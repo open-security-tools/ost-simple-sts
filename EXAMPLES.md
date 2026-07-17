@@ -41,7 +41,8 @@ requires an explicit matching request; it cannot be exchanged using the legacy e
 
 A workflow can request one installation token scoped to an exact set of repositories when the
 source branch and destination pull request live in different repositories. Both repositories must
-belong to the same App installation:
+belong to the same App installation. `permissions` is one permission ceiling applied to every
+repository in `target_repositories`; it cannot grant different permissions per target:
 
 ```json
 {
