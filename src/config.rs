@@ -36,6 +36,8 @@ pub struct PolicyRule {
     allowed_events: Vec<EventName>,
     permissions: Permissions,
     target: Option<RepositoryTarget>,
+    targets: Option<Vec<RepositoryTarget>>,
+    target_installation_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,17 @@ struct RawPolicyRule {
     target_repository: Option<String>,
     #[serde(default)]
     target_repository_id: Option<RepositoryId>,
+    #[serde(default)]
+    target_repositories: Option<Vec<RawRepositoryTarget>>,
+    #[serde(default)]
+    target_installation_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepositoryTarget {
+    repository: String,
+    repository_id: RepositoryId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,7 +283,32 @@ impl PolicyRule {
     }
 
     pub fn has_target_repository(&self) -> bool {
-        self.target.is_some()
+        self.target.is_some() || self.targets.is_some()
+    }
+
+    pub fn has_multiple_target_repositories(&self) -> bool {
+        self.targets.is_some()
+    }
+
+    pub fn target_repositories(&self) -> Vec<(RepositoryFullName, RepositoryId)> {
+        self.targets.as_ref().map_or_else(
+            || {
+                vec![(
+                    self.target_repository().clone(),
+                    self.target_repository_id(),
+                )]
+            },
+            |targets| {
+                targets
+                    .iter()
+                    .map(|target| (target.repository.clone(), target.repository_id))
+                    .collect()
+            },
+        )
+    }
+
+    pub fn target_installation_id(&self) -> Option<u64> {
+        self.target_installation_id
     }
 }
 
@@ -330,6 +368,44 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             (None, None) => None,
             _ => return Err(AppError::InvalidPolicy),
         };
+        let targets = raw
+            .target_repositories
+            .map(|targets| {
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        Ok(RepositoryTarget {
+                            repository: target
+                                .repository
+                                .try_into()
+                                .map_err(|_| AppError::InvalidPolicy)?,
+                            repository_id: target.repository_id,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()
+            })
+            .transpose()?;
+        if target.is_some() && targets.is_some() {
+            return Err(AppError::InvalidPolicy);
+        }
+        if let Some(targets) = targets.as_ref() {
+            if targets.len() < 2
+                || raw.target_installation_id.is_none_or(|id| id == 0)
+                || targets.iter().enumerate().any(|(index, target)| {
+                    targets[..index].iter().any(|previous| {
+                        previous.repository_id == target.repository_id
+                            || previous
+                                .repository
+                                .as_str()
+                                .eq_ignore_ascii_case(target.repository.as_str())
+                    })
+                })
+            {
+                return Err(AppError::InvalidPolicy);
+            }
+        } else if raw.target_installation_id.is_some() {
+            return Err(AppError::InvalidPolicy);
+        }
 
         Ok(Self {
             subject: raw.subject.try_into()?,
@@ -345,6 +421,8 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             allowed_events,
             permissions: raw.permissions.unwrap_or_else(Permissions::contents_write),
             target,
+            targets,
+            target_installation_id: raw.target_installation_id,
         })
     }
 }
@@ -766,6 +844,126 @@ mod tests {
             }));
 
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn policy_accepts_an_exact_multi_repository_target_set() {
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:astral-sh/uv-dev:environment:automations",
+                "repository": "astral-sh/uv-dev",
+                "repository_id": 1302176231,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/promote-pull-request.yml",
+                "environment": "automations",
+                "allowed_events": ["workflow_dispatch"],
+                "permissions": { "contents": "write", "pull_requests": "write" },
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }]
+        }))
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert!(rule.has_target_repository());
+        assert!(rule.has_multiple_target_repositories());
+        assert_eq!(rule.target_installation_id(), Some(146796415));
+        assert_eq!(
+            rule.target_repositories()
+                .into_iter()
+                .map(|(repository, id)| (repository.as_str().to_string(), *id))
+                .collect::<Vec<_>>(),
+            [
+                ("astral-sh/uv".to_string(), 699532645),
+                ("astral-sh/uv-dev".to_string(), 1302176231)
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_rejects_invalid_or_mixed_multi_repository_targets() {
+        for target in [
+            json!({ "target_repositories": [], "target_installation_id": 146796415 }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ]
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 0
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "ASTRAL-SH/UV", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 699532645 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({
+                "target_repositories": [
+                    { "repository": "astral-sh/uv" },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({
+                "target_repository": "astral-sh/uv",
+                "target_repository_id": 699532645,
+                "target_repositories": [
+                    { "repository": "astral-sh/uv", "repository_id": 699532645 },
+                    { "repository": "astral-sh/uv-dev", "repository_id": 1302176231 }
+                ],
+                "target_installation_id": 146796415
+            }),
+            json!({ "target_installation_id": 146796415 }),
+        ] {
+            let mut rule = json!({
+                "subject": "repo:astral-sh/uv-dev:environment:automations",
+                "repository": "astral-sh/uv-dev",
+                "repository_id": 1302176231,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/promote-pull-request.yml",
+                "environment": "automations"
+            });
+            rule.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+
+            let result: Result<Policy, _> = serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [rule]
+            }));
+            assert!(result.is_err(), "accepted invalid target: {target}");
         }
     }
 

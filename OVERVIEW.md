@@ -38,23 +38,31 @@ The service exposes two routes:
 The bundled action requires `exchange-url` to be the configured HTTPS `audience` URL followed by
 `/exchange`, preventing an unexpected endpoint from receiving the OIDC token. Non-URL audiences are
 not supported. The action safely writes returned values, masks both the OIDC and installation
-tokens, and exposes `token`, `expires-at`, `repository`, and `ref` outputs. It revokes the
+tokens, and exposes `token`, `expires-at`, `repository` or `repositories`, and `ref` outputs. It revokes the
 installation token when the job finishes; if revocation cannot complete, the action emits a warning
 and the token expires after one hour.
 
 The exchange receives an OIDC token in `Authorization: Bearer <oidc-jwt>` and an optional bounded
-JSON body of the form `{"repository":"OWNER/REPO","permissions":{"contents":"write"}}`. It
+JSON body of the form `{"repository":"OWNER/REPO","permissions":{"contents":"write"}}` or
+`{"repositories":["OWNER/REPO","OWNER/OTHER"],"permissions":{"contents":"write"}}`. It
 validates the token signature against the cached GitHub Actions JWKS and validates its issuer,
 audience, subject, expiry,
 not-before, and issued-at claims. The caller's `workflow_ref` must match the selected rule's
 repository, workflow path, and ref. If the job runs in a reusable workflow, its
 `job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
 reusable workflow. The event must be listed in the matched rule's `allowed_events`. If a target
-repository is configured, the request body is required and its repository must exactly match that
-target. Installation lookup and token minting use only the matched target and never the calling
-repository. A legacy empty body remains supported for same-repository rules. Requested repository
-permissions must be a subset of the matching rule's configured permissions. The service rejects
-unknown, duplicate, or broader permissions.
+repository or target set is configured, the request body is required and must exactly match that
+target. Singular and plural requests cannot be mixed. Installation lookup and token minting use only
+the matched targets and never an implicit calling repository; every plural target must resolve to
+the rule's pinned installation ID, and the repositories returned by GitHub must exactly match the
+configured names and IDs. A legacy empty body remains supported for same-repository rules.
+Requested repository permissions must be a subset of the matching rule's configured permissions.
+The service rejects unknown, duplicate, or broader permissions.
+
+GitHub applies one permission map to every repository selected for an installation token. A
+cross-repository pull-request publisher therefore needs source-branch write access (typically
+`contents: write`) as well as `pull_requests: write`; `workflows: write` is needed only if it
+actually pushes workflow-file changes.
 
 The JWKS cache refreshes at most once every 30 seconds for an unknown key ID, allowing key rotation
 without letting unauthenticated requests amplify outbound traffic. The OIDC `jti` is claimed with

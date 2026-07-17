@@ -97,9 +97,12 @@ The exchange succeeds only when all of these checks pass:
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,
-`job_workflow_path`, `target_repository`, and `target_repository_id` are optional; the two target
-fields must either both be present or both be omitted. All other rule fields are required, unknown
-fields and duplicate permissions are rejected, and values from different rules are never combined.
+`job_workflow_path`, `target_repository`, and `target_repository_id` are optional; the two singular
+target fields must either both be present or both be omitted. A multi-repository rule instead sets
+`target_repositories` to an exact list of repository-name/ID pairs and `target_installation_id` to
+their shared installation ID. Singular and plural targets are mutually exclusive; plural targets
+must contain at least two unique names and IDs. All other rule fields are required, unknown fields
+and duplicate permissions are rejected, and values from different rules are never combined.
 
 For `pull_request` runs, set `ref` to `refs/pull/*/merge` to match only canonical pull-request merge
 refs. This pattern is valid only with `allowed_events: ["pull_request"]`. `workflow_path` always

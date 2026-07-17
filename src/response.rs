@@ -18,13 +18,15 @@ impl AppResponse {
     pub(crate) fn exchange(
         token: Token,
         expires_at: impl Into<String>,
-        repository: impl Into<String>,
+        repository: Option<String>,
+        repositories: Option<Vec<String>>,
         git_ref: impl Into<String>,
     ) -> Self {
         Self::Exchange(ExchangeResponse {
             token,
             expires_at: expires_at.into(),
-            repository: repository.into(),
+            repository,
+            repositories,
             git_ref: git_ref.into(),
         })
     }
@@ -47,7 +49,10 @@ pub(crate) struct HealthResponse {
 pub(crate) struct ExchangeResponse {
     token: Token,
     expires_at: String,
-    repository: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repositories: Option<Vec<String>>,
     #[serde(rename = "ref")]
     git_ref: String,
 }
@@ -114,7 +119,8 @@ mod tests {
         let response = AppResponse::exchange(
             token,
             "2026-03-28T00:00:00Z",
-            "octo/tools",
+            Some("octo/tools".to_string()),
+            None,
             "refs/heads/main",
         );
 
@@ -131,6 +137,33 @@ mod tests {
                 "token": "ghs_secret",
                 "expires_at": "2026-03-28T00:00:00Z",
                 "repository": "octo/tools",
+                "ref": "refs/heads/main"
+            })
+        );
+    }
+
+    #[test]
+    fn multi_repository_exchange_response_serializes_the_exact_target_set() {
+        let token: Token = serde_json::from_str(r#""ghs_secret""#).unwrap();
+        let response = AppResponse::exchange(
+            token,
+            "2026-03-28T00:00:00Z",
+            None,
+            Some(vec!["octo/tools".to_string(), "octo/tools-dev".to_string()]),
+            "refs/heads/main",
+        );
+
+        let response = response.into_response();
+        let Body::Binary(body) = response.body() else {
+            panic!("expected JSON response body");
+        };
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "token": "ghs_secret",
+                "expires_at": "2026-03-28T00:00:00Z",
+                "repositories": ["octo/tools", "octo/tools-dev"],
                 "ref": "refs/heads/main"
             })
         );

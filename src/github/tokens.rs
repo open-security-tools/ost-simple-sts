@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::api::{github_api_url, github_request, send_github_request, GithubApiBase};
-use super::{Permissions, RepositoryFullName};
+use super::{Permissions, RepositoryFullName, RepositoryId};
 use crate::error::AppError;
 
 /// Wraps a sensitive GitHub access token while redacting debug and display output.
@@ -148,8 +148,7 @@ pub async fn mint_installation_token(
     github_api_base: &GithubApiBase,
     app_jwt: &str,
     installation_id: u64,
-    repository_id: u64,
-    repository: &RepositoryFullName,
+    repositories: &[(RepositoryFullName, RepositoryId)],
     permissions: &Permissions,
 ) -> Result<InstallationToken, AppError> {
     let url = github_api_url(
@@ -157,7 +156,7 @@ pub async fn mint_installation_token(
         &format!("app/installations/{installation_id}/access_tokens"),
     )?;
     let payload = json!({
-        "repository_ids": [repository_id],
+        "repository_ids": repositories.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
         "permissions": permissions,
     });
 
@@ -179,9 +178,12 @@ pub async fn mint_installation_token(
                     tracing::error!(?error, "failed to decode installation token response");
                     AppError::GithubAccessTokenRequestFailed
                 })?;
-            if token.repositories.len() != 1
-                || token.repositories[0].id != repository_id
-                || token.repositories[0].full_name != repository.as_str()
+            if token.repositories.len() != repositories.len()
+                || !repositories.iter().all(|(repository, repository_id)| {
+                    token.repositories.iter().any(|granted| {
+                        granted.id == **repository_id && granted.full_name == repository.as_str()
+                    })
+                })
             {
                 tracing::error!("github returned an unexpectedly scoped installation token");
                 return Err(AppError::InstallationTokenRequestInvalid);
@@ -323,8 +325,10 @@ mod tests {
             &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             123,
-            42,
-            &RepositoryFullName::try_from("octo/tools").unwrap(),
+            &[(
+                RepositoryFullName::try_from("octo/tools").unwrap(),
+                serde_json::from_value(json!(42)).unwrap(),
+            )],
             &serde_json::from_value(json!({ "contents": "write", "pull_requests": "read" }))
                 .unwrap(),
         )
@@ -349,8 +353,10 @@ mod tests {
             &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
             123,
-            42,
-            &RepositoryFullName::try_from("octo/tools").unwrap(),
+            &[(
+                RepositoryFullName::try_from("octo/tools").unwrap(),
+                serde_json::from_value(json!(42)).unwrap(),
+            )],
             &Permissions::contents_write(),
         )
         .await
@@ -381,8 +387,10 @@ mod tests {
                 &GithubApiBase::for_test(server.uri().as_str()),
                 "app-jwt",
                 999,
-                1,
-                &RepositoryFullName::try_from("octo/tools").unwrap(),
+                &[(
+                    RepositoryFullName::try_from("octo/tools").unwrap(),
+                    serde_json::from_value(json!(1)).unwrap(),
+                )],
                 &Permissions::contents_write(),
             )
             .await
@@ -421,8 +429,112 @@ mod tests {
                 &GithubApiBase::for_test(server.uri().as_str()),
                 "app-jwt",
                 123,
-                42,
-                &target,
+                &[(target.clone(), serde_json::from_value(json!(42)).unwrap())],
+                &Permissions::contents_write(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, AppError::InstallationTokenRequestInvalid));
+            server.reset().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mints_and_verifies_an_exact_multi_repository_installation_token() {
+        let server = MockServer::start().await;
+        let targets = vec![
+            (
+                RepositoryFullName::try_from("astral-sh/uv").unwrap(),
+                serde_json::from_value(json!(699532645)).unwrap(),
+            ),
+            (
+                RepositoryFullName::try_from("astral-sh/uv-dev").unwrap(),
+                serde_json::from_value(json!(1302176231)).unwrap(),
+            ),
+        ];
+        Mock::given(method("POST"))
+            .and(path("/app/installations/146796415/access_tokens"))
+            .and(body_json(json!({
+                "repository_ids": [699532645, 1302176231],
+                "permissions": { "contents": "write", "pull_requests": "write" }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "token": "ghs_multi",
+                "expires_at": "2026-03-28T00:00:00Z",
+                "repositories": [
+                    { "id": 1302176231, "full_name": "astral-sh/uv-dev" },
+                    { "id": 699532645, "full_name": "astral-sh/uv" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let token = mint_installation_token(
+            &reqwest::Client::new(),
+            &GithubApiBase::for_test(server.uri().as_str()),
+            "app-jwt",
+            146796415,
+            &targets,
+            &serde_json::from_value(json!({ "contents": "write", "pull_requests": "write" }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(token.token.as_str(), "ghs_multi");
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unexpected_multi_repository_installation_token_scope() {
+        let server = MockServer::start().await;
+        let targets = vec![
+            (
+                RepositoryFullName::try_from("astral-sh/uv").unwrap(),
+                serde_json::from_value(json!(699532645)).unwrap(),
+            ),
+            (
+                RepositoryFullName::try_from("astral-sh/uv-dev").unwrap(),
+                serde_json::from_value(json!(1302176231)).unwrap(),
+            ),
+        ];
+
+        for repositories in [
+            json!([]),
+            json!([{ "id": 699532645, "full_name": "astral-sh/uv" }]),
+            json!([
+                { "id": 699532645, "full_name": "astral-sh/uv" },
+                { "id": 1302176232, "full_name": "astral-sh/uv-dev" }
+            ]),
+            json!([
+                { "id": 699532645, "full_name": "astral-sh/uv" },
+                { "id": 1302176231, "full_name": "astral-sh/other" }
+            ]),
+            json!([
+                { "id": 699532645, "full_name": "astral-sh/uv" },
+                { "id": 699532645, "full_name": "astral-sh/uv" }
+            ]),
+            json!([
+                { "id": 699532645, "full_name": "astral-sh/uv" },
+                { "id": 1302176231, "full_name": "astral-sh/uv-dev" },
+                { "id": 123, "full_name": "astral-sh/other" }
+            ]),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/app/installations/146796415/access_tokens"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "token": "ghs_multi",
+                    "expires_at": "2026-03-28T00:00:00Z",
+                    "repositories": repositories
+                })))
+                .mount(&server)
+                .await;
+
+            let error = mint_installation_token(
+                &reqwest::Client::new(),
+                &GithubApiBase::for_test(server.uri().as_str()),
+                "app-jwt",
+                146796415,
+                &targets,
                 &Permissions::contents_write(),
             )
             .await
