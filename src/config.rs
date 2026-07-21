@@ -1,4 +1,4 @@
-use std::{env, fmt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, fmt, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
@@ -6,6 +6,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     error::AppError,
@@ -17,16 +18,16 @@ use crate::{
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
-const HOSTED_POLICY_VERSION: u64 = 1;
+const MAX_HOSTED_POLICY_RULES: usize = 100;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "RawPolicy")]
 pub struct Policy {
     expected_audience: Audience,
     rules: Vec<PolicyRule>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyRule {
     subject: Subject,
     repository: RepositoryFullName,
@@ -42,7 +43,7 @@ pub struct PolicyRule {
     target_installation_id: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RepositoryTarget {
     repository: RepositoryFullName,
     repository_id: RepositoryId,
@@ -60,6 +61,54 @@ struct RawPolicy {
 struct RawHostedPolicy {
     version: u64,
     rules: Vec<RawPolicyRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHostedPolicyV2 {
+    version: u64,
+    repositories: BTreeMap<String, RawRepositoryV2>,
+    #[serde(default)]
+    installations: BTreeMap<String, u64>,
+    rules: Vec<RawPolicyRuleV2>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRepositoryV2 {
+    name: String,
+    id: RepositoryId,
+    oidc_subject: OidcSubjectFormat,
+    #[serde(default)]
+    owner_id: Option<RepositoryId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OidcSubjectFormat {
+    Legacy,
+    Immutable,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPolicyRuleV2 {
+    caller: String,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default = "default_caller_ref")]
+    caller_ref: String,
+    caller_workflow: String,
+    #[serde(default)]
+    reusable_workflow: Option<String>,
+    on: Vec<String>,
+    permissions: Permissions,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    targets: Option<Vec<String>>,
+    #[serde(default)]
+    installation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +216,24 @@ fn is_valid_workflow_path(value: &str) -> bool {
         && (value.ends_with(".yml") || value.ends_with(".yaml"))
 }
 
+fn is_valid_workflow_filename(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains("..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && (value.ends_with(".yml") || value.ends_with(".yaml"))
+}
+
+fn is_valid_alias(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn is_valid_event_name(value: &str) -> bool {
     matches!(
         value,
@@ -196,6 +263,100 @@ fn is_valid_policy_ref(value: &str) -> bool {
 
 fn default_allowed_events() -> Vec<String> {
     vec!["workflow_dispatch".to_string()]
+}
+
+fn default_caller_ref() -> String {
+    "refs/heads/main".to_string()
+}
+
+struct StrictValue(Value);
+
+fn parse_strict_json(value: &[u8]) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice::<StrictValue>(value).map(|value| value.0)
+}
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StrictVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+            type Value = StrictValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| StrictValue(Value::Number(number)))
+                    .ok_or_else(|| E::custom("invalid JSON number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::String(value.to_string())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::String(value)))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::Null))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictValue(Value::Null))
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                StrictValue::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = access.next_element::<StrictValue>()? {
+                    values.push(value.0);
+                }
+                Ok(StrictValue(Value::Array(values)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, value)) = access.next_entry::<String, StrictValue>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON key: {key}"
+                        )));
+                    }
+                    values.insert(key, value.0);
+                }
+                Ok(StrictValue(Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(StrictVisitor)
+    }
 }
 
 crate::impl_string_newtype!(Audience, AppError, AppError::InvalidPolicy);
@@ -284,16 +445,27 @@ impl Policy {
     }
 
     pub fn from_hosted(policy_json: &str, expected_audience: &Audience) -> Result<Self, AppError> {
-        let raw: RawHostedPolicy =
-            serde_json::from_str(policy_json).map_err(|_| AppError::InvalidPolicy)?;
-        if raw.version != HOSTED_POLICY_VERSION {
-            return Err(AppError::InvalidPolicy);
+        let strict =
+            parse_strict_json(policy_json.as_bytes()).map_err(|_| AppError::InvalidPolicy)?;
+        match strict.get("version").and_then(Value::as_u64) {
+            Some(1) => {
+                let raw: RawHostedPolicy =
+                    serde_json::from_value(strict).map_err(|_| AppError::InvalidPolicy)?;
+                if raw.version != 1 || raw.rules.len() > MAX_HOSTED_POLICY_RULES {
+                    return Err(AppError::InvalidPolicy);
+                }
+                Self::try_from(RawPolicy {
+                    expected_audience: expected_audience.as_str().to_string(),
+                    rules: raw.rules,
+                })
+            }
+            Some(2) => {
+                let raw: RawHostedPolicyV2 =
+                    serde_json::from_value(strict).map_err(|_| AppError::InvalidPolicy)?;
+                raw.into_policy(expected_audience)
+            }
+            _ => Err(AppError::InvalidPolicy),
         }
-
-        Self::try_from(RawPolicy {
-            expected_audience: expected_audience.as_str().to_string(),
-            rules: raw.rules,
-        })
     }
 }
 
@@ -433,6 +605,13 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
         if allowed_events.is_empty() {
             return Err(AppError::InvalidPolicy);
         }
+        if allowed_events.iter().enumerate().any(|(index, event)| {
+            allowed_events[..index]
+                .iter()
+                .any(|previous| previous == event)
+        }) {
+            return Err(AppError::InvalidPolicy);
+        }
         if raw.git_ref == "refs/pull/*/merge"
             && allowed_events
                 .iter()
@@ -504,6 +683,150 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             target,
             targets,
             target_installation_id: raw.target_installation_id,
+        })
+    }
+}
+
+impl RawHostedPolicyV2 {
+    fn into_policy(self, expected_audience: &Audience) -> Result<Policy, AppError> {
+        if self.version != 2
+            || self.repositories.is_empty()
+            || self.repositories.len() > MAX_HOSTED_POLICY_RULES
+            || self.installations.len() > MAX_HOSTED_POLICY_RULES
+            || self.rules.is_empty()
+            || self.rules.len() > MAX_HOSTED_POLICY_RULES
+        {
+            return Err(AppError::InvalidPolicy);
+        }
+
+        for (alias, repository) in &self.repositories {
+            if !is_valid_alias(alias) {
+                return Err(AppError::InvalidPolicy);
+            }
+            RepositoryFullName::try_from(repository.name.as_str())
+                .map_err(|_| AppError::InvalidPolicy)?;
+            match (repository.oidc_subject, repository.owner_id) {
+                (OidcSubjectFormat::Legacy, None) | (OidcSubjectFormat::Immutable, Some(_)) => {}
+                (OidcSubjectFormat::Legacy, Some(_)) | (OidcSubjectFormat::Immutable, None) => {
+                    return Err(AppError::InvalidPolicy);
+                }
+            }
+        }
+        if self
+            .repositories
+            .values()
+            .enumerate()
+            .any(|(index, repository)| {
+                self.repositories.values().take(index).any(|previous| {
+                    previous.id == repository.id
+                        || previous.name.eq_ignore_ascii_case(&repository.name)
+                })
+            })
+        {
+            return Err(AppError::InvalidPolicy);
+        }
+        if self
+            .installations
+            .iter()
+            .any(|(alias, id)| !is_valid_alias(alias) || *id == 0)
+        {
+            return Err(AppError::InvalidPolicy);
+        }
+
+        let mut rules = Vec::with_capacity(self.rules.len());
+        for rule in self.rules {
+            if !is_valid_workflow_filename(&rule.caller_workflow)
+                || rule
+                    .reusable_workflow
+                    .as_deref()
+                    .is_some_and(|workflow| !is_valid_workflow_filename(workflow))
+            {
+                return Err(AppError::InvalidPolicy);
+            }
+            let caller = self
+                .repositories
+                .get(&rule.caller)
+                .ok_or(AppError::InvalidPolicy)?;
+            let caller_name = RepositoryFullName::try_from(caller.name.as_str())
+                .map_err(|_| AppError::InvalidPolicy)?;
+            let subject_prefix = match (caller.oidc_subject, caller.owner_id) {
+                (OidcSubjectFormat::Legacy, None) => format!("repo:{}", caller.name),
+                (OidcSubjectFormat::Immutable, Some(owner_id)) => format!(
+                    "repo:{}@{}/{}@{}",
+                    caller_name.owner(),
+                    *owner_id,
+                    caller_name.repo(),
+                    *caller.id
+                ),
+                (OidcSubjectFormat::Legacy, Some(_)) | (OidcSubjectFormat::Immutable, None) => {
+                    return Err(AppError::InvalidPolicy);
+                }
+            };
+            let subject = rule.environment.as_ref().map_or_else(
+                || format!("{subject_prefix}:ref:{}", rule.caller_ref),
+                |environment| format!("{subject_prefix}:environment:{environment}"),
+            );
+
+            let target = rule
+                .target
+                .as_ref()
+                .map(|alias| self.repositories.get(alias).ok_or(AppError::InvalidPolicy))
+                .transpose()?;
+            let targets = rule
+                .targets
+                .as_ref()
+                .map(|aliases| {
+                    aliases
+                        .iter()
+                        .map(|alias| {
+                            self.repositories
+                                .get(alias)
+                                .map(|repository| RawRepositoryTarget {
+                                    repository: repository.name.clone(),
+                                    repository_id: repository.id,
+                                })
+                                .ok_or(AppError::InvalidPolicy)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let installation = rule
+                .installation
+                .as_ref()
+                .map(|alias| {
+                    self.installations
+                        .get(alias)
+                        .copied()
+                        .ok_or(AppError::InvalidPolicy)
+                })
+                .transpose()?;
+            if target.is_some() && targets.is_some() || targets.is_some() != installation.is_some()
+            {
+                return Err(AppError::InvalidPolicy);
+            }
+
+            rules.push(RawPolicyRule {
+                subject,
+                repository: caller.name.clone(),
+                repository_id: caller.id,
+                git_ref: rule.caller_ref,
+                workflow_path: format!("{WORKFLOWS_PREFIX}{}", rule.caller_workflow),
+                job_workflow_path: rule
+                    .reusable_workflow
+                    .map(|workflow| format!("{WORKFLOWS_PREFIX}{workflow}")),
+                environment: rule.environment,
+                allowed_events: rule.on,
+                permissions: Some(rule.permissions),
+                target_repository: target.map(|repository| repository.name.clone()),
+                target_repository_id: target.map(|repository| repository.id),
+                target_repositories: targets,
+                target_installation_id: installation,
+            });
+        }
+
+        Policy::try_from(RawPolicy {
+            expected_audience: expected_audience.as_str().to_string(),
+            rules,
         })
     }
 }
@@ -849,6 +1172,102 @@ mod tests {
     }
 
     #[test]
+    fn hosted_policy_v2_derives_the_same_rules_as_v1() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let v1 = Policy::from_hosted(
+            r#"{
+                "version": 1,
+                "rules": [{
+                    "subject": "repo:astral-sh@115962839/uv-dev@1302176231:environment:automations",
+                    "repository": "astral-sh/uv-dev",
+                    "repository_id": 1302176231,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/promote-pull-request.yml",
+                    "environment": "automations",
+                    "allowed_events": ["workflow_dispatch"],
+                    "permissions": {"contents": "write", "pull_requests": "write"},
+                    "target_repositories": [
+                        {"repository": "astral-sh/uv", "repository_id": 699532645},
+                        {"repository": "astral-sh/uv-dev", "repository_id": 1302176231}
+                    ],
+                    "target_installation_id": 146796415
+                }, {
+                    "subject": "repo:astral-sh/uv:environment:automations",
+                    "repository": "astral-sh/uv",
+                    "repository_id": 699532645,
+                    "ref": "refs/pull/*/merge",
+                    "workflow_path": ".github/workflows/ci.yml",
+                    "job_workflow_path": ".github/workflows/pull-request-security-review.yml",
+                    "environment": "automations",
+                    "allowed_events": ["pull_request"],
+                    "permissions": {"pull_requests": "write"},
+                    "target_repository": "astral-sh/uv",
+                    "target_repository_id": 699532645
+                }, {
+                    "subject": "repo:astral-sh/uv:ref:refs/heads/main",
+                    "repository": "astral-sh/uv",
+                    "repository_id": 699532645,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/sync-uv-dev.yml",
+                    "allowed_events": ["push", "workflow_dispatch"],
+                    "permissions": {"contents": "write", "workflows": "write"},
+                    "target_repository": "astral-sh/uv-dev",
+                    "target_repository_id": 1302176231
+                }]
+            }"#,
+            &audience,
+        )
+        .unwrap();
+        let v2 = Policy::from_hosted(
+            r#"{
+                "version": 2,
+                "repositories": {
+                    "uv": {
+                        "name": "astral-sh/uv",
+                        "id": 699532645,
+                        "oidc_subject": "legacy"
+                    },
+                    "uv-dev": {
+                        "name": "astral-sh/uv-dev",
+                        "id": 1302176231,
+                        "oidc_subject": "immutable",
+                        "owner_id": 115962839
+                    }
+                },
+                "installations": {"automations": 146796415},
+                "rules": [{
+                    "caller": "uv-dev",
+                    "environment": "automations",
+                    "caller_workflow": "promote-pull-request.yml",
+                    "on": ["workflow_dispatch"],
+                    "permissions": {"contents": "write", "pull_requests": "write"},
+                    "targets": ["uv", "uv-dev"],
+                    "installation": "automations"
+                }, {
+                    "caller": "uv",
+                    "environment": "automations",
+                    "caller_ref": "refs/pull/*/merge",
+                    "caller_workflow": "ci.yml",
+                    "reusable_workflow": "pull-request-security-review.yml",
+                    "on": ["pull_request"],
+                    "permissions": {"pull_requests": "write"},
+                    "target": "uv"
+                }, {
+                    "caller": "uv",
+                    "caller_workflow": "sync-uv-dev.yml",
+                    "on": ["push", "workflow_dispatch"],
+                    "permissions": {"contents": "write", "workflows": "write"},
+                    "target": "uv-dev"
+                }]
+            }"#,
+            &audience,
+        )
+        .unwrap();
+
+        assert_eq!(v2, v1);
+    }
+
+    #[test]
     fn hosted_policy_example_or_override_is_valid() {
         let audience = Audience::try_from("https://example.com").unwrap();
         let policy = match std::env::var("HOSTED_POLICY_TEST_FILE") {
@@ -873,6 +1292,45 @@ mod tests {
             assert!(
                 Policy::from_hosted(invalid, &audience).is_err(),
                 "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_policy_v2_rejects_ambiguous_or_invalid_schema_and_rules() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        for invalid in [
+            r#"{"version":2,"repositories":{},"rules":[]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"standard"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"immutable"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy","owner_id":115962839}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv/other":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv/other","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"},"same":{"name":"ASTRAL-SH/UV","id":42,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"},"same":{"name":"astral-sh/other","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"installations":{"automations":0},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"missing","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":".github/workflows/release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","reusable_workflow":"../release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_ref":"main","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":[],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["push","push"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["pull_request_target"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_ref":"refs/pull/*/merge","caller_workflow":"release.yml","on":["push"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"target":"missing"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"installations":{"automations":146796415},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"targets":["uv","uv"],"installation":"automations"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"},"uv-dev":{"name":"astral-sh/uv-dev","id":1302176231,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"targets":["uv","uv-dev"],"installation":"missing"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"installations":{"automations":146796415},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"target":"uv","installation":"automations"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"installations":{"automations":146796415},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"target":"uv","targets":["uv","uv"],"installation":"automations"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"unknown":true}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"admin"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"},"uv-dev":{"name":"astral-sh/uv-dev","id":1302176231,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"target":"uv"},{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"},"target":"uv-dev"}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"},"uv":{"name":"astral-sh/other","id":42,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"installations":{"automations":146796415,"automations":42},"rules":[{"caller":"uv","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+            r#"{"version":2,"repositories":{"uv":{"name":"astral-sh/uv","id":699532645,"oidc_subject":"legacy"}},"rules":[{"caller":"uv","caller":"other","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{"contents":"write"}}]}"#,
+        ] {
+            assert!(
+                Policy::from_hosted(invalid, &audience).is_err(),
+                "accepted invalid v2 policy: {invalid}"
             );
         }
     }
@@ -1077,6 +1535,7 @@ mod tests {
             json!([""]),
             json!(["workflow_run"]),
             json!(["push", "pull_request_target"]),
+            json!(["push", "push"]),
         ] {
             let result: Result<Policy, _> = serde_json::from_value(json!({
                 "expected_audience": "https://example.com",

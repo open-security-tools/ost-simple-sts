@@ -54,7 +54,7 @@ audience, subject, expiry,
 not-before, and issued-at claims. The caller's `workflow_ref` must match the selected rule's
 repository, workflow path, and ref. If the job runs in a reusable workflow, its
 `job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
-reusable workflow. The event must be listed in the matched rule's `allowed_events`. If a target
+reusable workflow. The event must be listed in the matched rule's `on` list. If a target
 repository or target set is configured, the request body is required and must exactly match that
 target. Singular and plural requests cannot be mixed. Installation lookup and token minting use only
 the matched targets and never an implicit calling repository; every plural target must resolve to

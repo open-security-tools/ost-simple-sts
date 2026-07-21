@@ -1,15 +1,21 @@
 {
-  "version": 1,
+  "version": 2,
+  "repositories": {
+    "example-repo": {
+      "name": "example-org/example-repo",
+      "id": 789012,
+      "oidc_subject": "immutable",
+      "owner_id": 123456
+    }
+  },
   "rules": [
     {
-      "subject": "repo:example-org@123456/example-repo@789012:environment:release",
-      "repository": "example-org/example-repo",
-      "repository_id": 789012,
-      "ref": "refs/heads/main",
-      "workflow_path": ".github/workflows/release.yml",
-      "allowed_events": ["workflow_dispatch"],
+      "caller": "example-repo",
+      "environment": "release",
+      "caller_workflow": "release.yml",
+      "on": ["workflow_dispatch"],
       "permissions": { "contents": "write" },
-      "environment": "release"
+      "target": "example-repo"
     }
   ]
 }
