@@ -44,7 +44,7 @@ jobs:
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
-Set `audience` and the policy `expected_audience` to the deployed API URL, and `exchange-url` to
+Set `audience` and the deployment `POLICY_AUDIENCE` to the deployed API URL, and `exchange-url` to
 the same URL followed by `/exchange`. Set `repository` to the requested target repository and list
 one GitHub App repository permission per line in `permissions`. The action returns a short-lived
 token and revokes it when the job finishes, including after a failed step. Do not pass the token to
@@ -57,18 +57,20 @@ For the examples below, the GitHub App needs the following repository permission
 - **Contents**: read and write
 - **Metadata**: read-only
 
-Install the App on each target repository allowed by the policy; it does not need to be installed
-on a separate calling repository. The service requests only the permissions selected by the caller
-and allowed by the matched policy rule.
+Install the App on the repository that owns the policy and each target repository allowed by the
+policy; it does not need to be installed on a separate calling repository. The policy reader
+requests only `contents: read` for the pinned policy repository. Exchanges request only the
+permissions selected by the caller and allowed by the matched policy rule.
 
 ## Policy
 
-The checked-in [`policy-example.json`](./policy-example.json) is an example only. Copy it to the
-ignored `policy.json` and replace every example value for the calling repository:
+The checked-in [`policy-example.json`](./policy-example.json) is an example only. Copy it to
+`.github/ost-simple-sts.json` in the trusted policy repository and replace every example value for
+the calling repository:
 
 ```json
 {
-  "expected_audience": "https://example.execute-api.us-east-1.amazonaws.com",
+  "version": 1,
   "rules": [
     {
       "subject": "repo:example-org@123456/example-repo@789012:environment:release",
@@ -92,8 +94,9 @@ The exchange succeeds only when all of these checks pass:
 1. An event allowed by the matched rule
 1. The reusable workflow, if one is used
 
-`expected_audience` and a non-empty `rules` list are required. `allowed_events` can contain only
-`issues`, `push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to `["workflow_dispatch"]`. An empty
+`version: 1` and a non-empty `rules` list are required. `allowed_events` can contain only `issues`,
+`push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to
+`["workflow_dispatch"]`. An empty
 allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
 issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
 subset or lower level, but never an additional or broader permission. `environment`,
@@ -102,7 +105,9 @@ target fields must either both be present or both be omitted. A multi-repository
 `target_repositories` to an exact list of repository-name/ID pairs and `target_installation_id` to
 their shared installation ID. Singular and plural targets are mutually exclusive; plural targets
 must contain at least two unique names and IDs. All other rule fields are required, unknown fields
-and duplicate permissions are rejected, and values from different rules are never combined.
+and duplicate permissions are rejected, and values from different rules are never combined. Rules
+with the same caller identity, workflow paths, ref, environment, and an overlapping event are
+rejected so a later target or permission grant cannot be silently shadowed.
 
 For `pull_request` runs, set `ref` to `refs/pull/*/merge` to match only canonical pull-request merge
 refs. This pattern is valid only with `allowed_events: ["pull_request"]`. `workflow_path` always
@@ -121,14 +126,20 @@ gh api repos/OWNER/REPO --jq '{repository_id: .id}'
 
 Keep the environment's deployment rules restricted to the intended branch.
 
+The policy is fetched from the configured repository name and immutable ID, the protected `main`
+ref, and the configured path under `.github`. Protect the default branch with a pull-request
+ruleset that cannot be bypassed by an issued token. A successfully parsed policy is cached for up
+to five minutes; invalid, unavailable, or rate-limited refreshes fail closed and cannot authorize
+an exchange.
+
 ## Deploy
 
-Create the local configuration, set the App ID and private-key location in `.env`, and edit the
-policy for the calling repositories:
+Create the local configuration, set the policy repository identity and OIDC audience, and set the
+App ID and private-key location in `.env`. Commit the policy to the trusted repository before
+deploying:
 
 ```bash
 cp .env.example .env
-cp policy-example.json policy.json
 mkdir -p .secrets
 # place the App PEM at .secrets/github-app-private-key.pem
 make deploy-secrets
@@ -136,7 +147,8 @@ make deploy
 ```
 
 The stack provisions the exchange API, Lambda, replay protection, logging, and alarms. The App ID
-and private key are stored in AWS. Deployment settings can be overridden in `.env`;
+and private key are stored in AWS; the policy rules remain in the trusted repository. Deployment
+settings can be overridden in `.env`;
 `ENV_FILE=/path/to/.env make deploy` selects another environment file.
 
 ## How it works
@@ -144,7 +156,8 @@ and private key are stored in AWS. Deployment settings can be overridden in `.en
 The exchange lifecycle is roughly:
 
 1. Receive a GitHub Actions OIDC token
-1. Validate the token and match one configured policy rule
+1. Validate the token, fetch the trusted policy when the cache expires, and match one configured
+   policy rule
 1. Reject tokens that have already been exchanged
 1. Mint and return a repository-scoped GitHub App token
 
@@ -156,4 +169,6 @@ See [`OVERVIEW.md`](./OVERVIEW.md) for the security, API, and deployment details
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
+# Validate a hosted policy before a protected-branch update
+HOSTED_POLICY_TEST_FILE=/path/to/.github/ost-simple-sts.json cargo test hosted_policy_example_or_override_is_valid --locked
 ```

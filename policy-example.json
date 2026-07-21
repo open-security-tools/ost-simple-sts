@@ -1,5 +1,5 @@
 {
-  "expected_audience": "https://example.execute-api.us-east-1.amazonaws.com",
+  "version": 1,
   "rules": [
     {
       "subject": "repo:example-org@123456/example-repo@789012:environment:release",

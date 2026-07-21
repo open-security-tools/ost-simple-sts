@@ -13,9 +13,35 @@ Globals:
     MemorySize: 256
 
 Parameters:
-  PolicyJson:
+  PolicyRepository:
     Type: String
-    Description: JSON policy document for OIDC validation
+    MinLength: 3
+    MaxLength: 201
+    AllowedPattern: '(?!.*[.][.])(?!.*[.](/|$))[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}'
+    Description: Repository that owns the trusted broker policy
+  PolicyRepositoryId:
+    Type: Number
+    MinValue: 1
+    Description: Immutable ID of the policy repository
+  PolicyInstallationId:
+    Type: Number
+    MinValue: 1
+    Description: GitHub App installation that can read the policy repository
+  PolicyPath:
+    Type: String
+    Default: .github/ost-simple-sts.json
+    MinLength: 14
+    MaxLength: 300
+    AllowedPattern: '[.]github/(?!.*[.][.])(?!.*[.](/|$))([A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}/)*[A-Za-z0-9_-][A-Za-z0-9_.-]{0,94}[.]json'
+    Description: JSON policy path under .github
+  PolicyRef:
+    Type: String
+    Default: main
+    AllowedValues: [main]
+  PolicyAudience:
+    Type: String
+    MinLength: 1
+    Description: Expected GitHub Actions OIDC audience for broker exchanges
   AppIdParameterName:
     Type: String
     Default: /ost/app-id
@@ -88,7 +114,12 @@ Resources:
         LogGroup: !Ref FunctionLogGroup
       Environment:
         Variables:
-          POLICY_JSON: !Ref PolicyJson
+          POLICY_REPOSITORY: !Ref PolicyRepository
+          POLICY_REPOSITORY_ID: !Ref PolicyRepositoryId
+          POLICY_INSTALLATION_ID: !Ref PolicyInstallationId
+          POLICY_PATH: !Ref PolicyPath
+          POLICY_REF: !Ref PolicyRef
+          POLICY_AUDIENCE: !Ref PolicyAudience
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           JTI_TABLE_NAME: !Ref JtiTableName

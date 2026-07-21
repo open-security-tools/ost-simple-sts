@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    config::{Config, GitRef},
+    config::{Config, GitRef, Policy},
     error::AppError,
     github::{self, Jti, Permissions, RepositoryFullName, RepositoryId},
     replay,
@@ -102,7 +102,7 @@ async fn verify_oidc_claims(
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&[ACTIONS_ISSUER]);
-    validation.set_audience(&[config.policy.expected_audience().as_str()]);
+    validation.set_audience(&[config.policy_audience.as_str()]);
     validation.leeway = CLOCK_TOLERANCE_SECONDS;
     validation.validate_nbf = true;
     validation.required_spec_claims = ["iss", "sub", "aud", "exp", "nbf", "iat"]
@@ -125,7 +125,29 @@ async fn verify_oidc_claims(
         return Err(AppError::InvalidOidcToken);
     }
 
-    let mut rules = config.policy.rules().iter().collect::<Vec<_>>();
+    let loaded_policy = config
+        .policy_cache
+        .get_or_load(|| async {
+            let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
+            let policy = github::fetch_policy(
+                &config.http_client,
+                &config.github_api_base,
+                &app_jwt,
+                &config.policy_location,
+            )
+            .await?;
+            Policy::from_hosted(&policy, &config.policy_audience)
+        })
+        .await?;
+    if let Some(retry_after) = loaded_policy.retry_after() {
+        return Err(AppError::GithubRateLimited { retry_after });
+    }
+    let policy = loaded_policy.policy();
+    if policy.expected_audience() != &config.policy_audience {
+        return Err(AppError::InvalidPolicy);
+    }
+
+    let mut rules = policy.rules().iter().collect::<Vec<_>>();
     rules.retain(|rule| claims.subject.as_deref() == Some(rule.subject().as_str()));
     if rules.is_empty() {
         return Err(AppError::SubjectNotAllowed);
@@ -680,7 +702,9 @@ mod integration_tests {
             let jwks_cache = Arc::new(JwksCache::new_with_url(http_client.clone(), jwks_url));
 
             Config {
-                policy,
+                policy_location: crate::config::PolicyLocation::for_test(),
+                policy_audience: policy.expected_audience().clone(),
+                policy_cache: Arc::new(crate::policy_cache::PolicyCache::with_policy(policy)),
                 app_id: "test-app-id".try_into().unwrap(),
                 app_private_key: "test-key-not-used".try_into().unwrap(),
                 jti_table_name: "test-table".try_into().unwrap(),
@@ -1366,6 +1390,150 @@ mod integration_tests {
                 serde_json::to_value(verified.permissions).unwrap(),
                 json!({ "contents": "write", "pull_requests": "write" })
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_the_uv_caller_rebase_reusable_workflow_rule() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/pull-request-conflicts.yml",
+                "job_workflow_path": ".github/workflows/rebase-conflicted-pull-request.yml",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "permissions": {"contents": "write", "workflows": "write"},
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+
+        for event in ["push", "workflow_dispatch"] {
+            let mut claims = fixture.valid_claims();
+            claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+            claims["repository"] = json!("astral-sh/uv");
+            claims["repository_id"] = json!(699532645);
+            claims["event_name"] = json!(event);
+            claims["workflow_ref"] =
+                json!("astral-sh/uv/.github/workflows/pull-request-conflicts.yml@refs/heads/main");
+            claims["job_workflow_ref"] = json!(
+                "astral-sh/uv/.github/workflows/rebase-conflicted-pull-request.yml@refs/heads/main"
+            );
+            claims["environment"] = json!("automations");
+            let token = fixture.sign_claims(claims);
+            let request = fixture.make_scoped_request(
+                &token,
+                "astral-sh/uv-dev",
+                json!({"contents": "write", "workflows": "write"}),
+            );
+
+            let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+            assert_eq!(verified.target_repository.as_str(), "astral-sh/uv-dev");
+            assert_eq!(*verified.target_repository_id, 1302176231);
+            assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_accepts_the_uv_caller_diagnose_workflow_rule() {
+        let fixture = TestFixture::new().await;
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": fixture.server.uri(),
+            "rules": [{
+                "subject": "repo:astral-sh/uv:environment:automations",
+                "repository": "astral-sh/uv",
+                "repository_id": 699532645,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/diagnose-workflow-failure.yml",
+                "allowed_events": ["workflow_dispatch"],
+                "permissions": {"issues": "write"},
+                "target_repository": "astral-sh/uv-dev",
+                "target_repository_id": 1302176231
+            }]
+        }))
+        .unwrap();
+        let config = fixture.build_config(policy);
+        let mut claims = fixture.valid_claims();
+        claims["sub"] = json!("repo:astral-sh/uv:environment:automations");
+        claims["repository"] = json!("astral-sh/uv");
+        claims["repository_id"] = json!(699532645);
+        claims["event_name"] = json!("workflow_dispatch");
+        claims["workflow_ref"] =
+            json!("astral-sh/uv/.github/workflows/diagnose-workflow-failure.yml@refs/heads/main");
+        claims["job_workflow_ref"] = json!(null);
+        claims["environment"] = json!("automations");
+        let token = fixture.sign_claims(claims);
+        let request =
+            fixture.make_scoped_request(&token, "astral-sh/uv-dev", json!({"issues": "write"}));
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+
+        assert_eq!(verified.target_repository.as_str(), "astral-sh/uv-dev");
+        assert_eq!(*verified.target_repository_id, 1302176231);
+        assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
+        assert_eq!(
+            serde_json::to_value(verified.permissions).unwrap(),
+            json!({"issues": "write"})
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_oidc_claims_fails_closed_when_the_hosted_policy_cannot_be_refreshed() {
+        for response in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200).set_body_string(r#"{"version":2,"rules":[]}"#),
+            ResponseTemplate::new(403).insert_header("retry-after", "2"),
+        ] {
+            let fixture = TestFixture::new().await;
+            let mut config = fixture.build_config(fixture.policy());
+            config.policy_cache = Arc::new(crate::policy_cache::PolicyCache::default());
+            config.app_private_key = RSA_PRIVATE_KEY.try_into().unwrap();
+            Mock::given(method("POST"))
+                .and(path("/app/installations/456/access_tokens"))
+                .and(body_json(json!({
+                    "repository_ids": [42],
+                    "permissions": {"contents": "read"}
+                })))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "token": "policy-token",
+                    "repositories": [{"id": 42, "full_name": "octo/tools"}],
+                    "permissions": {"contents": "read", "metadata": "read"}
+                })))
+                .expect(1)
+                .mount(&fixture.server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/repos/octo/tools/contents/.github/ost-simple-sts.json",
+                ))
+                .respond_with(response)
+                .expect(1)
+                .mount(&fixture.server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/installation/token"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&fixture.server)
+                .await;
+
+            let token = fixture.sign_claims(fixture.valid_claims());
+            let request = fixture.make_request(&token);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                AppError::PolicyLookupFailed
+                    | AppError::InvalidPolicy
+                    | AppError::GithubRateLimited { .. }
+            ));
         }
     }
 
