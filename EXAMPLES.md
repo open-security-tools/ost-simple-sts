@@ -3,6 +3,29 @@
 These examples use fictional repositories and repository IDs. Replace them with the identities and
 workflow paths from your installation.
 
+The rules below assume these top-level aliases. The caller's `oidc_subject` format determines
+whether the broker derives a legacy or immutable OIDC subject; the immutable format also requires
+the repository owner's ID:
+
+```json
+{
+  "repositories": {
+    "widgets": {
+      "name": "octo-org/widgets",
+      "id": 123456789,
+      "oidc_subject": "legacy"
+    },
+    "widgets-dev": {
+      "name": "octo-org/widgets-dev",
+      "id": 987654321,
+      "oidc_subject": "immutable",
+      "owner_id": 24680
+    }
+  },
+  "installations": { "automations": 13579 }
+}
+```
+
 ## Cross-repository fork sync
 
 A workflow in one repository can update a different repository without granting the caller access.
@@ -11,16 +34,12 @@ This rule lets a fork-sync workflow in `octo-org/widgets` receive a token scoped
 
 ```json
 {
-  "subject": "repo:octo-org/widgets:environment:automations",
-  "repository": "octo-org/widgets",
-  "repository_id": 123456789,
-  "ref": "refs/heads/main",
-  "workflow_path": ".github/workflows/sync-fork.yml",
+  "caller": "widgets",
   "environment": "automations",
-  "allowed_events": ["push", "workflow_dispatch"],
+  "caller_workflow": "sync-fork.yml",
+  "on": ["push", "workflow_dispatch"],
   "permissions": { "contents": "write" },
-  "target_repository": "octo-org/widgets-dev",
-  "target_repository_id": 987654321
+  "target": "widgets-dev"
 }
 ```
 
@@ -42,23 +61,17 @@ requires an explicit matching request; it cannot be exchanged using the legacy e
 A workflow can request one installation token scoped to an exact set of repositories when the
 source branch and destination pull request live in different repositories. Both repositories must
 belong to the same App installation. `permissions` is one permission ceiling applied to every
-repository in `target_repositories`; it cannot grant different permissions per target:
+repository in `targets`; it cannot grant different permissions per target:
 
 ```json
 {
-  "subject": "repo:octo-org/widgets-dev:environment:automations",
-  "repository": "octo-org/widgets-dev",
-  "repository_id": 987654321,
-  "ref": "refs/heads/main",
-  "workflow_path": ".github/workflows/promote-pull-request.yml",
+  "caller": "widgets-dev",
   "environment": "automations",
-  "allowed_events": ["workflow_dispatch"],
+  "caller_workflow": "promote-pull-request.yml",
+  "on": ["workflow_dispatch"],
   "permissions": { "contents": "write", "pull_requests": "write" },
-  "target_repositories": [
-    { "repository": "octo-org/widgets", "repository_id": 123456789 },
-    { "repository": "octo-org/widgets-dev", "repository_id": 987654321 }
-  ],
-  "target_installation_id": 24680
+  "targets": ["widgets", "widgets-dev"],
+  "installation": "automations"
 }
 ```
 
@@ -91,16 +104,13 @@ CI caller and the reusable publisher and issues only pull-request write access f
 
 ```json
 {
-  "subject": "repo:octo-org/widgets:environment:automations",
-  "repository": "octo-org/widgets",
-  "repository_id": 123456789,
-  "ref": "refs/pull/*/merge",
-  "workflow_path": ".github/workflows/ci.yml",
-  "job_workflow_path": ".github/workflows/publish-review.yml",
+  "caller": "widgets",
   "environment": "automations",
-  "allowed_events": ["pull_request"],
+  "caller_ref": "refs/pull/*/merge",
+  "caller_workflow": "ci.yml",
+  "reusable_workflow": "publish-review.yml",
+  "on": ["pull_request"],
   "permissions": { "pull_requests": "write" },
-  "target_repository": "octo-org/widgets",
-  "target_repository_id": 123456789
+  "target": "widgets"
 }
 ```

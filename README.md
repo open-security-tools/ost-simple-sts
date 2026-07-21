@@ -70,17 +70,23 @@ the calling repository:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "repositories": {
+    "example-repo": {
+      "name": "example-org/example-repo",
+      "id": 789012,
+      "oidc_subject": "immutable",
+      "owner_id": 123456
+    }
+  },
   "rules": [
     {
-      "subject": "repo:example-org@123456/example-repo@789012:environment:release",
-      "repository": "example-org/example-repo",
-      "repository_id": 789012,
-      "ref": "refs/heads/main",
-      "workflow_path": ".github/workflows/release.yml",
-      "allowed_events": ["workflow_dispatch"],
+      "caller": "example-repo",
+      "environment": "release",
+      "caller_workflow": "release.yml",
+      "on": ["workflow_dispatch"],
       "permissions": { "contents": "write" },
-      "environment": "release"
+      "target": "example-repo"
     }
   ]
 }
@@ -94,37 +100,44 @@ The exchange succeeds only when all of these checks pass:
 1. An event allowed by the matched rule
 1. The reusable workflow, if one is used
 
-`version: 1` and a non-empty `rules` list are required. `allowed_events` can contain only `issues`,
-`push`, `pull_request`, and `workflow_dispatch`; if omitted, it defaults to
-`["workflow_dispatch"]`. An empty
-allowlist is rejected. `permissions` is the maximum set of repository permissions the rule may
-issue; if omitted, it defaults to `{"contents":"write"}` for compatibility. Requests can select a
-subset or lower level, but never an additional or broader permission. `environment`,
-`job_workflow_path`, `target_repository`, and `target_repository_id` are optional; the two singular
-target fields must either both be present or both be omitted. A multi-repository rule instead sets
-`target_repositories` to an exact list of repository-name/ID pairs and `target_installation_id` to
-their shared installation ID. Singular and plural targets are mutually exclusive; plural targets
-must contain at least two unique names and IDs. All other rule fields are required, unknown fields
-and duplicate permissions are rejected, and values from different rules are never combined. Rules
-with the same caller identity, workflow paths, ref, environment, and an overlapping event are
-rejected so a later target or permission grant cannot be silently shadowed.
+`version: 2`, a non-empty `repositories` map, and a non-empty `rules` list are required. Each
+repository alias pins its name and immutable ID and declares the OIDC subject format. Use
+`oidc_subject: "legacy"` for `repo:OWNER/REPO` subjects and `oidc_subject: "immutable"` with an
+`owner_id` for `repo:OWNER@OWNER_ID/REPO@REPOSITORY_ID` subjects. The broker derives the exact
+subject from the caller repository, its configured format, and `environment` (or `caller_ref` when
+no environment is set), so callers cannot accidentally mix the two formats.
 
-For `pull_request` runs, set `ref` to `refs/pull/*/merge` to match only canonical pull-request merge
-refs. This pattern is valid only with `allowed_events: ["pull_request"]`. `workflow_path` always
-binds the calling workflow's `workflow_ref`; set `job_workflow_path` when the token is requested by
-a reusable workflow so its `job_workflow_ref` must match as well.
+Each rule names a `caller`, a `caller_workflow` filename under `.github/workflows`, a non-empty `on`
+event list, and an explicit `permissions` ceiling. `caller_ref` defaults to `refs/heads/main`; set
+`reusable_workflow` when the token is requested by a reusable workflow so its `job_workflow_ref`
+must match as well. `on` can contain only `issues`, `push`, `pull_request`, and
+`workflow_dispatch`; empty or duplicate event lists are rejected. Requests can select a subset or
+lower permission level, but never an additional or broader permission.
+
+`target` names one repository alias. A multi-repository rule instead sets `targets` to an exact
+list of at least two aliases and `installation` to an alias in the top-level `installations` map.
+Singular and plural targets are mutually exclusive, and an explicit target always requires an
+explicit matching exchange request, even when it is the caller repository. Unknown fields and
+aliases, duplicate repository names or IDs, duplicate permissions, and overlapping identity rules
+are rejected so a later target or permission grant cannot be silently shadowed.
+
+For `pull_request` runs, set `caller_ref` to `refs/pull/*/merge` to match only canonical
+pull-request merge refs. This pattern is valid only with `on: ["pull_request"]`.
 
 See [`EXAMPLES.md`](./EXAMPLES.md) for cross-repository and reusable-workflow policy examples.
 
-`subject` must exactly match the OIDC subject emitted by the calling job. The default subject format
-for an environment-bound job is `repo:OWNER/REPO:environment:ENVIRONMENT`. Always bind the
-immutable `repository_id` claim separately; find it with:
+The derived subject must exactly match the OIDC subject emitted by the calling job. Always pin the
+immutable repository ID; find repository and owner IDs with:
 
 ```bash
-gh api repos/OWNER/REPO --jq '{repository_id: .id}'
+gh api repos/OWNER/REPO --jq '{repository_id: .id, owner_id: .owner.id}'
 ```
 
 Keep the environment's deployment rules restricted to the intended branch.
+
+The broker continues to accept `version: 1` policies during migration. Those policies retain the
+explicit `subject`, repository name/ID pairs, workflow paths, `allowed_events`, and target fields;
+the compatibility defaults for events and permissions are unchanged.
 
 The policy is fetched from the configured repository name and immutable ID, the protected `main`
 ref, and the configured path under `.github`. Protect the default branch with a pull-request
