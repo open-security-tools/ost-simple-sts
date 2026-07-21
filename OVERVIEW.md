@@ -12,9 +12,11 @@ HTTP / Lambda
               │                validated repository permissions and access levels
               ├── repositories.rs
               │                validated repository and jti types
+              ├── policy.rs    read-only policy token, bounded fetch, and revocation
               └── tokens.rs    App JWT, installation lookup, and token creation
 
 src/config.rs                  validated policy and runtime configuration
+src/policy_cache.rs            last-known-good policy cache and refresh backoff
 src/error.rs                   stable error codes and HTTP status mapping
 src/response.rs                no-store JSON responses and token redaction
 ```
@@ -22,7 +24,9 @@ src/response.rs                no-store JSON responses and token redaction
 ## Data flow
 
 1. `/exchange` receives a GitHub Actions OIDC JWT.
-1. The JWT is validated against the Actions JWKS and configured policy.
+1. The JWT is validated against the Actions JWKS and configured audience.
+1. A read-only App token fetches the protected repository policy when the cache expires.
+1. The complete policy is validated before it replaces the cached snapshot.
 1. The `jti` is claimed in DynamoDB to prevent replay.
 1. A GitHub App JWT is minted from the configured App ID and private key.
 1. The matched target repository installation is resolved.
@@ -72,6 +76,15 @@ Requests to the following GitHub routes are expected:
 
 - `GET /repos/{owner}/{repo}/installation`
 - `POST /app/installations/{installation_id}/access_tokens`
+- `GET /repos/{owner}/{repo}/contents/{policy_path}?ref=main`
+- `DELETE /installation/token`
+
+The policy reader requests a token scoped to the pinned policy repository ID with only
+`contents: read`, verifies the returned repository name, ID, and permission map, fetches at most
+256 KiB from the configured path and protected `main` ref, then revokes the read token. A parsed
+policy is cached for up to five minutes with per-worker jitter. Rate limits use bounded exponential
+backoff and retain a last-known-good snapshot for at most one hour, but exchanges are denied during
+backoff; any other fetch or parse failure clears the cached snapshot and fails closed.
 
 The installation lookup retries transient failures and secondary rate limits once with bounded
 backoff. Token creation is deliberately not retried because the POST is not idempotent. Private
@@ -104,13 +117,17 @@ for Lambda errors and throttles, API 5xx responses, GitHub App dependency failur
 receive notifications. Access logs deliberately omit request headers, OIDC claims, and response
 bodies.
 
-`make deploy-secrets` stores the App ID and private key in AWS. `make deploy` compacts the local
-policy and deploys the SAM stack. `POLICY_FILE`, `STACK_NAME`, `APP_ID_PARAMETER`,
-`JTI_TABLE_NAME`, and the optional `ALARM_TOPIC_ARN` can be overridden in `.env`.
+`make deploy-secrets` stores the App ID and private key in AWS. `make deploy` configures the policy
+repository, path, protected ref, and expected OIDC audience, then deploys the SAM stack. Set
+`POLICY_REPOSITORY`, `POLICY_REPOSITORY_ID`, `POLICY_INSTALLATION_ID`, `POLICY_PATH`,
+`POLICY_REF`, `POLICY_AUDIENCE`, `STACK_NAME`, `APP_ID_PARAMETER`, `JTI_TABLE_NAME`, and the
+optional `ALARM_TOPIC_ARN` in `.env`. Protect the policy repository's default branch with a
+pull-request ruleset that issued tokens cannot bypass.
 
 ## Validated domain types
 
-- `Policy`, `PolicyRule`, `Audience`, `Subject`, `GitRef`, `WorkflowPath`, `EnvironmentName`
+- `Policy`, `PolicyRule`, `PolicyLocation`, `PolicyPath`, `PolicyRef`, `Audience`, `Subject`,
+  `GitRef`, `WorkflowPath`, `EnvironmentName`
 - `RepositoryFullName`, `RepositoryOwner`, `RepositoryNamePart`, `RepositoryId`
 - `GithubApiBase`, `JtiTableName`, `Jti`, `Token`
 

@@ -58,6 +58,7 @@ mod error;
 mod exchange;
 mod github;
 mod jwks;
+mod policy_cache;
 mod replay;
 mod response;
 #[cfg(test)]
@@ -129,7 +130,9 @@ mod integration_tests {
         let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
 
         config::Config {
-            policy,
+            policy_location: config::PolicyLocation::for_test(),
+            policy_audience: policy.expected_audience().clone(),
+            policy_cache: Arc::new(crate::policy_cache::PolicyCache::with_policy(policy)),
             app_id: "123".try_into().unwrap(),
             app_private_key: "dummy-private-key".try_into().unwrap(),
             jti_table_name: "jti-table".try_into().unwrap(),

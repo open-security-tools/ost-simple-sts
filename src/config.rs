@@ -11,11 +11,13 @@ use crate::{
     error::AppError,
     github::{GithubApiBase, Permissions, RepositoryFullName, RepositoryId},
     jwks::JwksCache,
+    policy_cache::PolicyCache,
 };
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const HOSTED_POLICY_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "RawPolicy")]
@@ -50,6 +52,13 @@ struct RepositoryTarget {
 #[serde(deny_unknown_fields)]
 struct RawPolicy {
     expected_audience: String,
+    rules: Vec<RawPolicyRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHostedPolicy {
+    version: u64,
     rules: Vec<RawPolicyRule>,
 }
 
@@ -114,6 +123,21 @@ pub struct AppPrivateKey(String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JtiTableName(String);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyPath(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRef(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyLocation {
+    repository: RepositoryFullName,
+    repository_id: RepositoryId,
+    installation_id: u64,
+    path: PolicyPath,
+    git_ref: PolicyRef,
+}
+
 fn is_valid_git_ref(value: &str) -> bool {
     value
         .strip_prefix("refs/heads/")
@@ -150,6 +174,26 @@ fn is_valid_event_name(value: &str) -> bool {
     )
 }
 
+fn is_valid_policy_path(value: &str) -> bool {
+    let Some(path) = value.strip_prefix(".github/") else {
+        return false;
+    };
+    value.len() <= 300
+        && path.ends_with(".json")
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+fn is_valid_policy_ref(value: &str) -> bool {
+    value == "main"
+}
+
 fn default_allowed_events() -> Vec<String> {
     vec!["workflow_dispatch".to_string()]
 }
@@ -177,6 +221,18 @@ crate::impl_string_newtype!(
 );
 crate::impl_string_newtype!(AppId, AppError, AppError::AppIdNotConfigured);
 crate::impl_string_newtype!(JtiTableName, AppError, AppError::JtiTableNotConfigured);
+crate::impl_string_newtype!(
+    PolicyPath,
+    AppError,
+    AppError::PolicyNotConfigured,
+    validate = is_valid_policy_path
+);
+crate::impl_string_newtype!(
+    PolicyRef,
+    AppError,
+    AppError::PolicyNotConfigured,
+    validate = is_valid_policy_ref
+);
 
 impl fmt::Debug for AppPrivateKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -227,9 +283,17 @@ impl Policy {
         &self.rules
     }
 
-    pub fn from_env() -> Result<Self, AppError> {
-        let policy_json = env::var("POLICY_JSON").map_err(|_| AppError::PolicyNotConfigured)?;
-        policy_json.parse()
+    pub fn from_hosted(policy_json: &str, expected_audience: &Audience) -> Result<Self, AppError> {
+        let raw: RawHostedPolicy =
+            serde_json::from_str(policy_json).map_err(|_| AppError::InvalidPolicy)?;
+        if raw.version != HOSTED_POLICY_VERSION {
+            return Err(AppError::InvalidPolicy);
+        }
+
+        Self::try_from(RawPolicy {
+            expected_audience: expected_audience.as_str().to_string(),
+            rules: raw.rules,
+        })
     }
 }
 
@@ -330,6 +394,23 @@ impl TryFrom<RawPolicy> for Policy {
             .map(PolicyRule::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         if rules.is_empty() {
+            return Err(AppError::InvalidPolicy);
+        }
+        if rules.iter().enumerate().any(|(index, rule)| {
+            rules[..index].iter().any(|previous| {
+                previous.subject == rule.subject
+                    && previous.repository == rule.repository
+                    && previous.repository_id == rule.repository_id
+                    && previous.git_ref == rule.git_ref
+                    && previous.workflow_path == rule.workflow_path
+                    && previous.job_workflow_path == rule.job_workflow_path
+                    && previous.environment == rule.environment
+                    && previous
+                        .allowed_events
+                        .iter()
+                        .any(|event| rule.allowed_events.contains(event))
+            })
+        }) {
             return Err(AppError::InvalidPolicy);
         }
 
@@ -470,6 +551,70 @@ impl JtiTableName {
     }
 }
 
+impl PolicyLocation {
+    pub fn from_env() -> Result<Self, AppError> {
+        let repository = env::var("POLICY_REPOSITORY")
+            .map_err(|_| AppError::PolicyNotConfigured)?
+            .try_into()
+            .map_err(|_| AppError::PolicyNotConfigured)?;
+        let repository_id = env::var("POLICY_REPOSITORY_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(RepositoryId::new)
+            .ok_or(AppError::PolicyNotConfigured)?;
+        let installation_id = env::var("POLICY_INSTALLATION_ID")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value != 0)
+            .ok_or(AppError::PolicyNotConfigured)?;
+        let path = env::var("POLICY_PATH")
+            .map_err(|_| AppError::PolicyNotConfigured)?
+            .try_into()?;
+        let git_ref = env::var("POLICY_REF")
+            .map_err(|_| AppError::PolicyNotConfigured)?
+            .try_into()?;
+
+        Ok(Self {
+            repository,
+            repository_id,
+            installation_id,
+            path,
+            git_ref,
+        })
+    }
+
+    pub fn repository(&self) -> &RepositoryFullName {
+        &self.repository
+    }
+
+    pub fn repository_id(&self) -> RepositoryId {
+        self.repository_id
+    }
+
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
+    }
+
+    pub fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    pub fn git_ref(&self) -> &PolicyRef {
+        &self.git_ref
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            repository: "octo/tools".try_into().unwrap(),
+            repository_id: RepositoryId::new(42).unwrap(),
+            installation_id: 456,
+            path: ".github/ost-simple-sts.json".try_into().unwrap(),
+            git_ref: "main".try_into().unwrap(),
+        }
+    }
+}
+
 impl TryFrom<String> for AppPrivateKey {
     type Error = AppError;
 
@@ -493,7 +638,9 @@ impl TryFrom<&str> for AppPrivateKey {
 
 #[derive(Clone)]
 pub struct Config {
-    pub policy: Policy,
+    pub policy_location: PolicyLocation,
+    pub policy_audience: Audience,
+    pub policy_cache: Arc<PolicyCache>,
     pub app_id: AppId,
     pub app_private_key: AppPrivateKey,
     pub jti_table_name: JtiTableName,
@@ -515,7 +662,10 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 impl Config {
     pub async fn load() -> Result<Self, Error> {
-        let policy = Policy::from_env()?;
+        let policy_location = PolicyLocation::from_env()?;
+        let policy_audience = env::var("POLICY_AUDIENCE")
+            .map_err(|_| AppError::PolicyNotConfigured)?
+            .try_into()?;
         let shared_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let ssm = SsmClient::new(&shared_config);
         let secrets = SecretsManagerClient::new(&shared_config);
@@ -540,7 +690,9 @@ impl Config {
         let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
 
         Ok(Self {
-            policy,
+            policy_location,
+            policy_audience,
+            policy_cache: Arc::new(PolicyCache::default()),
             app_id,
             app_private_key,
             jti_table_name,
@@ -554,7 +706,10 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_http_client, AppPrivateKey, GitRef, Policy, WorkflowPath};
+    use super::{
+        build_http_client, AppPrivateKey, Audience, GitRef, Policy, PolicyPath, PolicyRef,
+        WorkflowPath,
+    };
     use serde_json::json;
 
     #[test]
@@ -636,6 +791,151 @@ mod tests {
         .parse()
         .unwrap();
         assert_eq!(policy.rules()[0].git_ref().as_str(), "refs/heads/main");
+    }
+
+    #[test]
+    fn hosted_policy_accepts_the_versioned_rule_document() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let policy = Policy::from_hosted(
+            r#"{
+                "version": 1,
+                "rules": [{
+                    "subject": "repo:astral-sh/uv:environment:automations",
+                    "repository": "astral-sh/uv",
+                    "repository_id": 699532645,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/pull-request-conflicts.yml",
+                    "job_workflow_path": ".github/workflows/rebase-conflicted-pull-request.yml",
+                    "allowed_events": ["push", "workflow_dispatch"],
+                    "target_repository": "astral-sh/uv-dev",
+                    "target_repository_id": 1302176231,
+                    "permissions": {"contents": "write", "workflows": "write"}
+                }]
+            }"#,
+            &audience,
+        )
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(policy.expected_audience(), &audience);
+        assert_eq!(
+            rule.subject().as_str(),
+            "repo:astral-sh/uv:environment:automations"
+        );
+        assert_eq!(rule.repository().as_str(), "astral-sh/uv");
+        assert_eq!(*rule.repository_id(), 699532645);
+        assert_eq!(rule.git_ref().as_str(), "refs/heads/main");
+        assert_eq!(
+            rule.workflow_path().as_str(),
+            ".github/workflows/pull-request-conflicts.yml"
+        );
+        assert_eq!(
+            rule.job_workflow_path().unwrap().as_str(),
+            ".github/workflows/rebase-conflicted-pull-request.yml"
+        );
+        assert_eq!(
+            rule.allowed_events()
+                .iter()
+                .map(|event| event.as_str())
+                .collect::<Vec<_>>(),
+            ["push", "workflow_dispatch"]
+        );
+        assert_eq!(rule.target_repository().as_str(), "astral-sh/uv-dev");
+        assert_eq!(*rule.target_repository_id(), 1302176231);
+        assert_eq!(
+            serde_json::to_value(rule.permissions()).unwrap(),
+            json!({"contents": "write", "workflows": "write"})
+        );
+    }
+
+    #[test]
+    fn hosted_policy_example_or_override_is_valid() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let policy = match std::env::var("HOSTED_POLICY_TEST_FILE") {
+            Ok(path) => std::fs::read_to_string(path).unwrap(),
+            Err(_) => include_str!("../policy-example.json").to_string(),
+        };
+
+        assert!(Policy::from_hosted(&policy, &audience).is_ok());
+    }
+
+    #[test]
+    fn hosted_policy_rejects_unknown_or_invalid_schema_and_rules() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        for invalid in [
+            r#"{"rules":[]}"#,
+            r#"{"version":2,"rules":[]}"#,
+            r#"{"version":1,"rules":[],"expected_audience":"https://example.com"}"#,
+            r#"{"version":1,"rules":[],"unknown":true}"#,
+            r#"{"version":1,"version":1,"rules":[]}"#,
+            r#"{"version":1,"rules":[{"subject":"repo:octo/tools:environment:automations","repository":"octo/tools","repository_id":42,"ref":"refs/heads/main","workflow_path":".github/workflows/release.yml","permissions":{"contents":"admin"}}]}"#,
+        ] {
+            assert!(
+                Policy::from_hosted(invalid, &audience).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_rejects_overlapping_identity_rules_with_different_targets() {
+        let result: Result<Policy, _> = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:octo/tools:environment:automations",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "allowed_events": ["push", "workflow_dispatch"],
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84,
+                "permissions": {"contents": "write"}
+            }, {
+                "subject": "repo:octo/tools:environment:automations",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "allowed_events": ["workflow_dispatch"],
+                "target_repository": "octo/other",
+                "target_repository_id": 85,
+                "permissions": {"contents": "write"}
+            }]
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_accepts_matching_identities_with_disjoint_events() {
+        let policy: Policy = serde_json::from_value(json!({
+            "expected_audience": "https://example.com",
+            "rules": [{
+                "subject": "repo:octo/tools:environment:automations",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "allowed_events": ["push"],
+                "target_repository": "octo/tools-dev",
+                "target_repository_id": 84,
+                "permissions": {"contents": "write"}
+            }, {
+                "subject": "repo:octo/tools:environment:automations",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "allowed_events": ["workflow_dispatch"],
+                "target_repository": "octo/other",
+                "target_repository_id": 85,
+                "permissions": {"contents": "write"}
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(policy.rules().len(), 2);
     }
 
     #[test]
@@ -998,6 +1298,26 @@ mod tests {
     fn workflow_path_requires_github_workflows_prefix() {
         assert!(WorkflowPath::try_from("release.yml").is_err());
         assert!(WorkflowPath::try_from(".github/workflows/release.yml").is_ok());
+    }
+
+    #[test]
+    fn hosted_policy_location_rejects_unsafe_paths_and_non_default_refs() {
+        assert!(PolicyPath::try_from(".github/ost-simple-sts.json").is_ok());
+        assert!(PolicyPath::try_from(".github/policies/simple-sts.json").is_ok());
+        for invalid in [
+            "ost-simple-sts.json",
+            ".github/../policy.json",
+            ".github//policy.json",
+            ".github/policy.yaml",
+            ".github/policy.json?ref=other",
+            ".github/policy%2fother.json",
+        ] {
+            assert!(PolicyPath::try_from(invalid).is_err(), "{invalid}");
+        }
+        assert!(PolicyRef::try_from("main").is_ok());
+        for invalid in ["refs/heads/main", "feature", "main?ref=feature", ""] {
+            assert!(PolicyRef::try_from(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

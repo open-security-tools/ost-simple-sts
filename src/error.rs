@@ -1,6 +1,6 @@
 use lambda_http::http::StatusCode;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AppError {
     #[error("policy is not configured")]
     PolicyNotConfigured,
@@ -76,6 +76,10 @@ pub enum AppError {
     InstallationTokenRequestInvalid,
     #[error("github access token request failed")]
     GithubAccessTokenRequestFailed,
+    #[error("github policy lookup failed")]
+    PolicyLookupFailed,
+    #[error("github request was rate limited")]
+    GithubRateLimited { retry_after: std::time::Duration },
 }
 
 impl AppError {
@@ -118,6 +122,8 @@ impl AppError {
             Self::InstallationNotFound => "installation_not_found",
             Self::InstallationTokenRequestInvalid => "installation_token_request_invalid",
             Self::GithubAccessTokenRequestFailed => "github_access_token_request_failed",
+            Self::PolicyLookupFailed => "policy_lookup_failed",
+            Self::GithubRateLimited { .. } => "github_rate_limited",
         }
     }
 
@@ -157,9 +163,10 @@ impl AppError {
             Self::GithubAppAuthInvalid
             | Self::GithubInstallationLookupForbidden
             | Self::GithubAccessTokenRequestForbidden => StatusCode::FAILED_DEPENDENCY,
-            Self::GithubInstallationLookupFailed | Self::GithubAccessTokenRequestFailed => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::GithubInstallationLookupFailed
+            | Self::GithubAccessTokenRequestFailed
+            | Self::PolicyLookupFailed
+            | Self::GithubRateLimited { .. } => StatusCode::BAD_GATEWAY,
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidExchangeRequest => StatusCode::BAD_REQUEST,
         }
