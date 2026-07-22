@@ -44,11 +44,13 @@ jobs:
       - run: echo "Use the scoped GitHub App token to release"
 ```
 
-Set `audience` and the deployment `POLICY_AUDIENCE` to the deployed API URL, and `exchange-url` to
-the same URL followed by `/exchange`. Set `repository` to the requested target repository and list
-one GitHub App repository permission per line in `permissions`. The action returns a short-lived
-token and revokes it when the job finishes, including after a failed step. Do not pass the token to
-another job. Pin actions to a commit SHA in production.
+Set `audience` to the stack's `PolicyAudience` output and `exchange-url` to the same URL followed
+by `/exchange`. The deployment uses its API URL as the OIDC audience by default; set
+`POLICY_AUDIENCE` only when overriding it for a custom HTTPS endpoint. Set `repository` to the
+requested target repository and list one GitHub App repository permission per line in
+`permissions`. The action returns a short-lived token and revokes it when the job finishes,
+including after a failed step. Do not pass the token to another job. Pin actions to a commit SHA in
+production.
 
 ## GitHub App
 
@@ -147,9 +149,10 @@ an exchange.
 
 ## Deploy
 
-Create the local configuration, set the policy repository identity and OIDC audience, and set the
-App ID and private-key location in `.env`. Commit the policy to the trusted repository before
-deploying:
+Create the local configuration, set the policy repository identity, and set the App ID and
+private-key location in `.env`. The OIDC audience defaults to the deployed API URL; set
+`POLICY_AUDIENCE` only when using a custom HTTPS endpoint. Commit the policy to the trusted
+repository before deploying:
 
 ```bash
 cp .env.example .env

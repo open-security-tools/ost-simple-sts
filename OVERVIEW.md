@@ -118,11 +118,12 @@ receive notifications. Access logs deliberately omit request headers, OIDC claim
 bodies.
 
 `make deploy-secrets` stores the App ID and private key in AWS. `make deploy` configures the policy
-repository, path, protected ref, and expected OIDC audience, then deploys the SAM stack. Set
-`POLICY_REPOSITORY`, `POLICY_REPOSITORY_ID`, `POLICY_INSTALLATION_ID`, `POLICY_PATH`,
-`POLICY_REF`, `POLICY_AUDIENCE`, `STACK_NAME`, `APP_ID_PARAMETER`, `JTI_TABLE_NAME`, and the
-optional `ALARM_TOPIC_ARN` in `.env`. Protect the policy repository's default branch with a
-pull-request ruleset that issued tokens cannot bypass.
+repository, path, and protected ref, then deploys the SAM stack. The OIDC audience defaults to the
+deployed API URL. Set `POLICY_REPOSITORY`, `POLICY_REPOSITORY_ID`, `POLICY_INSTALLATION_ID`,
+`POLICY_PATH`, `POLICY_REF`, `STACK_NAME`, `APP_ID_PARAMETER`, and `JTI_TABLE_NAME` in `.env`.
+Set `POLICY_AUDIENCE` only when using a custom HTTPS endpoint; `ALARM_TOPIC_ARN` is optional as
+well. Protect the policy repository's default branch with a pull-request ruleset that issued tokens
+cannot bypass.
 
 ## Validated domain types
 

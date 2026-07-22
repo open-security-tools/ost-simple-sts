@@ -13,11 +13,11 @@
 #   POLICY_INSTALLATION_ID      GitHub App installation that can read the policy
 #   POLICY_PATH                 JSON policy path under .github
 #   POLICY_REF                  Protected policy ref (main)
-#   POLICY_AUDIENCE             Expected GitHub Actions OIDC audience
 #   APP_ID_PARAMETER            SSM parameter name for App ID
 #   APP_PRIVATE_KEY_SECRET_NAME Secrets Manager secret name
 #   JTI_TABLE_NAME              DynamoDB table name for JTI replay guard
 # Optional .env variables:
+#   POLICY_AUDIENCE             Custom OIDC audience; defaults to the deployed API URL
 #   ALARM_TOPIC_ARN             SNS topic ARN for CloudWatch alarm notifications
 #
 set -euo pipefail
@@ -58,7 +58,6 @@ require_var POLICY_REPOSITORY_ID
 require_var POLICY_INSTALLATION_ID
 require_var POLICY_PATH
 require_var POLICY_REF
-require_var POLICY_AUDIENCE
 require_var APP_ID_PARAMETER
 require_var APP_PRIVATE_KEY_SECRET_NAME
 require_var JTI_TABLE_NAME
@@ -82,7 +81,7 @@ sam deploy \
     "ParameterKey=PolicyInstallationId,ParameterValue=$POLICY_INSTALLATION_ID" \
     "ParameterKey=PolicyPath,ParameterValue=$POLICY_PATH" \
     "ParameterKey=PolicyRef,ParameterValue=$POLICY_REF" \
-    "ParameterKey=PolicyAudience,ParameterValue=$POLICY_AUDIENCE" \
+    "ParameterKey=PolicyAudience,ParameterValue=${POLICY_AUDIENCE:-}" \
     "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
     "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
     "ParameterKey=JtiTableName,ParameterValue=$JTI_TABLE_NAME" \
