@@ -4,6 +4,21 @@ Description: >
   ost-simple-sts - exchanges GitHub Actions OIDC tokens for short-lived
   GitHub App installation tokens.
 
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: ost-simple-sts
+    Description: Exchange GitHub Actions OIDC tokens for scoped GitHub App installation tokens.
+    Author: open-security-tools
+    LicenseUrl: LICENSE
+    ReadmeUrl: README.md
+    Labels:
+      - github-actions
+      - github-app
+      - oidc
+      - security
+    HomePageUrl: https://github.com/open-security-tools/ost-simple-sts
+    SourceCodeUrl: https://github.com/open-security-tools/ost-simple-sts
+
 Globals:
   Function:
     Runtime: provided.al2023
