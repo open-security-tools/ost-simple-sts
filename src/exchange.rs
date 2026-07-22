@@ -963,7 +963,7 @@ mod integration_tests {
                 "ref": "refs/heads/main",
                 "workflow_path": ".github/workflows/release.yml",
                 "environment": "release",
-                "allowed_events": ["push", "workflow_dispatch"],
+                "allowed_events": ["push", "schedule", "workflow_dispatch"],
                 "permissions": { "contents": "write" },
                 "target_repository": "octo/tools-dev",
                 "target_repository_id": 84
@@ -972,7 +972,7 @@ mod integration_tests {
         .unwrap();
         let config = fixture.build_config(policy);
 
-        for event in ["push", "workflow_dispatch"] {
+        for event in ["push", "schedule", "workflow_dispatch"] {
             let mut claims = fixture.valid_claims();
             claims["event_name"] = json!(event);
             let token = fixture.sign_claims(claims);

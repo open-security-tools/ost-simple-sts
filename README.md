@@ -110,7 +110,7 @@ no environment is set), so callers cannot accidentally mix the two formats.
 Each rule names a `caller`, a `caller_workflow` filename under `.github/workflows`, a non-empty `on`
 event list, and an explicit `permissions` ceiling. `caller_ref` defaults to `refs/heads/main`; set
 `reusable_workflow` when the token is requested by a reusable workflow so its `job_workflow_ref`
-must match as well. `on` can contain only `issues`, `push`, `pull_request`, and
+must match as well. `on` can contain only `issues`, `push`, `pull_request`, `schedule`, and
 `workflow_dispatch`; empty or duplicate event lists are rejected. Requests can select a subset or
 lower permission level, but never an additional or broader permission.
 
