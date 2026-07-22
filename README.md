@@ -188,9 +188,5 @@ HOSTED_POLICY_TEST_FILE=/path/to/.github/ost-simple-sts.json cargo test hosted_p
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Licensed under either the Apache License, Version 2.0, or the MIT license, at
+your option. See [LICENSE](LICENSE) for the full license texts.
