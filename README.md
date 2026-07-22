@@ -185,3 +185,8 @@ cargo test --workspace --locked
 # Validate a hosted policy before a protected-branch update
 HOSTED_POLICY_TEST_FILE=/path/to/.github/ost-simple-sts.json cargo test hosted_policy_example_or_override_is_valid --locked
 ```
+
+## License
+
+Licensed under either the Apache License, Version 2.0, or the MIT license, at
+your option. See [LICENSE](LICENSE) for the full license texts.
