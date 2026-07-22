@@ -237,7 +237,7 @@ fn is_valid_alias(value: &str) -> bool {
 fn is_valid_event_name(value: &str) -> bool {
     matches!(
         value,
-        "issues" | "push" | "pull_request" | "workflow_dispatch"
+        "issues" | "push" | "pull_request" | "schedule" | "workflow_dispatch"
     )
 }
 
@@ -1470,6 +1470,47 @@ mod tests {
     }
 
     #[test]
+    fn hosted_policy_v2_accepts_schedule_events() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let policy = Policy::from_hosted(
+            r#"{
+                "version": 2,
+                "repositories": {
+                    "uv": {
+                        "name": "astral-sh/uv",
+                        "id": 699532645,
+                        "oidc_subject": "legacy"
+                    }
+                },
+                "rules": [{
+                    "caller": "uv",
+                    "environment": "automations",
+                    "caller_workflow": "sync-python-releases.yml",
+                    "on": ["schedule", "workflow_dispatch"],
+                    "permissions": {"contents": "write", "pull_requests": "write"},
+                    "target": "uv"
+                }]
+            }"#,
+            &audience,
+        )
+        .unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(rule.git_ref().as_str(), "refs/heads/main");
+        assert_eq!(
+            rule.workflow_path().as_str(),
+            ".github/workflows/sync-python-releases.yml"
+        );
+        assert_eq!(
+            rule.allowed_events()
+                .iter()
+                .map(|event| event.as_str())
+                .collect::<Vec<_>>(),
+            ["schedule", "workflow_dispatch"]
+        );
+    }
+
+    #[test]
     fn policy_rejects_empty_strings() {
         let result: Result<Policy, _> = serde_json::from_value(json!({
             "expected_audience": "",
@@ -1557,6 +1598,7 @@ mod tests {
     fn policy_rejects_non_pull_request_events_for_a_pull_request_ref_pattern() {
         for allowed_events in [
             json!(["push"]),
+            json!(["schedule"]),
             json!(["workflow_dispatch"]),
             json!(["pull_request", "push"]),
         ] {
