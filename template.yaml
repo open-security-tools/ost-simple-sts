@@ -55,8 +55,8 @@ Parameters:
     AllowedValues: [main]
   PolicyAudience:
     Type: String
-    MinLength: 1
-    Description: Expected GitHub Actions OIDC audience for broker exchanges
+    Default: ''
+    Description: Optional GitHub Actions OIDC audience; defaults to the deployed API URL
   AppIdParameterName:
     Type: String
     Default: /ost/app-id
@@ -73,11 +73,21 @@ Parameters:
 
 Conditions:
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+  HasPolicyAudience: !Not [!Equals [!Ref PolicyAudience, '']]
 
 Resources:
   Api:
-    Type: AWS::Serverless::HttpApi
+    Type: AWS::ApiGatewayV2::Api
     Properties:
+      Name: !Ref AWS::StackName
+      ProtocolType: HTTP
+
+  ApiApiGatewayDefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: '$default'
+      AutoDeploy: true
       AccessLogSettings:
         DestinationArn: !GetAtt ApiAccessLogGroup.Arn
         Format: >-
@@ -134,24 +144,14 @@ Resources:
           POLICY_INSTALLATION_ID: !Ref PolicyInstallationId
           POLICY_PATH: !Ref PolicyPath
           POLICY_REF: !Ref PolicyRef
-          POLICY_AUDIENCE: !Ref PolicyAudience
+          POLICY_AUDIENCE: !If
+            - HasPolicyAudience
+            - !Ref PolicyAudience
+            - !GetAtt Api.ApiEndpoint
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           JTI_TABLE_NAME: !Ref JtiTableName
           RUST_LOG: warn
-      Events:
-        Health:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref Api
-            Path: /health
-            Method: GET
-        Exchange:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref Api
-            Path: /exchange
-            Method: POST
       Policies:
         - Statement:
             - Effect: Allow
@@ -167,6 +167,45 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}-??????
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationMethod: POST
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SimpleStsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /health
+      Target: !Sub integrations/${ApiIntegration}
+
+  ExchangeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /exchange
+      Target: !Sub integrations/${ApiIntegration}
+
+  SimpleStsFunctionHealthPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SimpleStsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/health
+
+  SimpleStsFunctionExchangePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SimpleStsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/exchange
 
   FunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -265,7 +304,13 @@ Resources:
 Outputs:
   ApiUrl:
     Description: Base API URL
-    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+    Value: !GetAtt Api.ApiEndpoint
+  PolicyAudience:
+    Description: Expected GitHub Actions OIDC audience
+    Value: !If
+      - HasPolicyAudience
+      - !Ref PolicyAudience
+      - !GetAtt Api.ApiEndpoint
   ExchangeUrl:
     Description: Full exchange endpoint URL
-    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/exchange
+    Value: !Sub ${Api.ApiEndpoint}/exchange
