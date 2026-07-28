@@ -101,7 +101,11 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/vendedlogs/${AWS::StackName}/http-api
+      LogGroupName: !Sub
+        - /aws/vendedlogs/${AWS::StackName}/${StackInstanceId}/http-api
+        - StackInstanceId: !Select
+            - 2
+            - !Split ['/', !Ref 'AWS::StackId']
       RetentionInDays: 30
 
   FunctionLogGroup:
@@ -109,7 +113,11 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-simple-sts
+      LogGroupName: !Sub
+        - /ost-simple-sts/${AWS::StackName}/${StackInstanceId}/simple-sts
+        - StackInstanceId: !Select
+            - 2
+            - !Split ['/', !Ref 'AWS::StackId']
       RetentionInDays: 30
 
   JtiTable:
