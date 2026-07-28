@@ -85,5 +85,5 @@ sam deploy \
     "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
     "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
     "ParameterKey=JtiTableName,ParameterValue=$JTI_TABLE_NAME" \
-    "ParameterKey=AlarmTopicArn,ParameterValue='${ALARM_TOPIC_ARN:-}'" \
+    "ParameterKey=AlarmTopicArn,ParameterValue=\"${ALARM_TOPIC_ARN:-}\"" \
   "$@"

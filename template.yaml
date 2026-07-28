@@ -101,7 +101,11 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/vendedlogs/${AWS::StackName}/http-api
+      LogGroupName: !Sub
+        - /aws/vendedlogs/${AWS::StackName}/${StackInstanceId}/http-api
+        - StackInstanceId: !Select
+            - 2
+            - !Split ['/', !Ref 'AWS::StackId']
       RetentionInDays: 30
 
   FunctionLogGroup:
@@ -109,7 +113,11 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-simple-sts
+      LogGroupName: !Sub
+        - /ost-simple-sts/${AWS::StackName}/${StackInstanceId}/simple-sts
+        - StackInstanceId: !Select
+            - 2
+            - !Split ['/', !Ref 'AWS::StackId']
       RetentionInDays: 30
 
   JtiTable:
@@ -209,6 +217,7 @@ Resources:
 
   FunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Lambda invocation errors for the credential broker
       Namespace: AWS/Lambda
@@ -222,10 +231,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   FunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Lambda throttles for the credential broker
       Namespace: AWS/Lambda
@@ -239,10 +250,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   Api5xxAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: HTTP API server errors for the credential broker
       Namespace: AWS/ApiGateway
@@ -256,10 +269,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   ApiDependencyFailureMetric:
     Type: AWS::Logs::MetricFilter
+    Condition: HasAlarmTopic
     Properties:
       LogGroupName: !Ref ApiAccessLogGroup
       FilterPattern: '{ ($.status = "422") || ($.status = "424") }'
@@ -272,6 +287,7 @@ Resources:
 
   ApiDependencyFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: GitHub App authentication, permission, or token-request failures
       Namespace: !Sub ${AWS::StackName}/simple-sts
@@ -282,10 +298,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   Api4xxAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Sustained HTTP API client-error spike for the credential broker
       Namespace: AWS/ApiGateway
@@ -299,7 +317,8 @@ Resources:
       Threshold: 100
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
 Outputs:
   ApiUrl:
