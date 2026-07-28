@@ -217,6 +217,7 @@ Resources:
 
   FunctionErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Lambda invocation errors for the credential broker
       Namespace: AWS/Lambda
@@ -230,10 +231,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   FunctionThrottlesAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Lambda throttles for the credential broker
       Namespace: AWS/Lambda
@@ -247,10 +250,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   Api5xxAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: HTTP API server errors for the credential broker
       Namespace: AWS/ApiGateway
@@ -264,10 +269,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   ApiDependencyFailureMetric:
     Type: AWS::Logs::MetricFilter
+    Condition: HasAlarmTopic
     Properties:
       LogGroupName: !Ref ApiAccessLogGroup
       FilterPattern: '{ ($.status = "422") || ($.status = "424") }'
@@ -280,6 +287,7 @@ Resources:
 
   ApiDependencyFailureAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: GitHub App authentication, permission, or token-request failures
       Namespace: !Sub ${AWS::StackName}/simple-sts
@@ -290,10 +298,12 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
   Api4xxAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmTopic
     Properties:
       AlarmDescription: Sustained HTTP API client-error spike for the credential broker
       Namespace: AWS/ApiGateway
@@ -307,7 +317,8 @@ Resources:
       Threshold: 100
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+      AlarmActions:
+        - !Ref AlarmTopicArn
 
 Outputs:
   ApiUrl:
