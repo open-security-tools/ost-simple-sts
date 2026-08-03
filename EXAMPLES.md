@@ -58,10 +58,10 @@ requires an explicit matching request; it cannot be exchanged using the legacy e
 
 ## Multi-repository pull-request publisher
 
-A workflow can request one installation token scoped to an exact set of repositories when the
-source branch and destination pull request live in different repositories. Both repositories must
-belong to the same App installation. `permissions` is one permission ceiling applied to every
-repository in `targets`; it cannot grant different permissions per target:
+A workflow can request one installation token scoped to authorized repositories when the source
+branch and destination pull request live in different repositories. Both repositories must belong
+to the same App installation. `permissions` is one permission ceiling applied to every repository
+in `targets`; it cannot grant different permissions per target:
 
 ```json
 {
@@ -75,7 +75,7 @@ repository in `targets`; it cannot grant different permissions per target:
 }
 ```
 
-The workflow requests the complete target set and permission map explicitly:
+The workflow requests the required target set and permission map explicitly:
 
 ```yaml
 repositories: |
@@ -86,9 +86,11 @@ permissions: |
   pull_requests: write
 ```
 
-The `repositories` action output contains the authorized repositories, one per line. Singular
-`repository` and plural `repositories` inputs are mutually exclusive, and a plural request must
-exactly match its policy rule; a subset or a combination of targets from different rules is denied.
+The `repositories` action output contains the requested repositories, one per line. A workflow
+that needs only one authorized target can use `repository: octo-org/widgets` instead, and its
+installation token is scoped only to that repository. Singular `repository` and plural
+`repositories` inputs are mutually exclusive; unknown repositories and combinations of targets
+from different rules are denied.
 
 GitHub applies one permission map to every repository in an installation token. Creating a
 cross-repository pull request requires write access to the source branch, so `pull_requests: write`
