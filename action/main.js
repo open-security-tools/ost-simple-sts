@@ -43,6 +43,24 @@ const repositoryPermissions = new Set([
   "workflows",
 ]);
 
+const branchRefPrefix = "refs/heads/";
+const maxBranchRefLength = 255;
+
+function validBranchRef(value) {
+  if (!value.startsWith(branchRefPrefix) || value.length > maxBranchRefLength) {
+    return false;
+  }
+
+  const branch = value.slice(branchRefPrefix.length);
+  return (
+    /^[A-Za-z0-9._/-]+$/u.test(branch) &&
+    !branch.startsWith("-") &&
+    !branch.endsWith(".") &&
+    !branch.includes("..") &&
+    branch.split("/").every((part) => part && !part.startsWith(".") && !part.endsWith(".lock"))
+  );
+}
+
 function parsePermissions(input) {
   const permissions = Object.create(null);
   for (const line of input.split(/\r?\n/u)) {
@@ -116,6 +134,36 @@ async function run({
   }
   const repositories = repositoriesInput && parseRepositories(repositoriesInput);
   const permissions = permissionsInput && parsePermissions(permissionsInput);
+  const delivery = env.INPUT_DELIVERY || "token";
+  if (delivery === "github-proxy" && env.RUNNER_DEBUG === "1") {
+    throw new Error(
+      "github-proxy delivery is disabled when RUNNER_DEBUG=1 because GitHub Actions debug logging may expose the proxy capability; disable runner debug logging and retry",
+    );
+  }
+  const branch = env.INPUT_BRANCH || "";
+  const expectedHead = env["INPUT_EXPECTED-HEAD"] || "";
+  let proxyDelivery;
+  if (delivery === "github-proxy") {
+    if (!repository || repositoriesInput) {
+      throw new Error("github-proxy delivery requires exactly one repository");
+    }
+    if (Object.keys(permissions).length !== 1 || permissions.contents !== "write") {
+      throw new Error("github-proxy delivery requires contents: write only");
+    }
+    const gitRef = branch.startsWith(branchRefPrefix) ? branch : `${branchRefPrefix}${branch}`;
+    if (
+      !validBranchRef(gitRef) ||
+      ["refs/heads/main", "refs/heads/master"].includes(gitRef)
+    ) {
+      throw new Error("github-proxy delivery requires a safe, non-protected branch");
+    }
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(expectedHead)) {
+      throw new Error("github-proxy delivery requires an expected-head object ID");
+    }
+    proxyDelivery = { kind: "github_proxy", ref: gitRef, expected_old_oid: expectedHead };
+  } else if (delivery !== "token" || branch || expectedHead) {
+    throw new Error("branch and expected-head are supported only with github-proxy delivery");
+  }
 
   const oidcRequestUrl = env.ACTIONS_ID_TOKEN_REQUEST_URL;
   const oidcRequestToken = env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
@@ -146,13 +194,56 @@ async function run({
         ...((repository || repositories) && { "content-type": "application/json" }),
       },
       body: repository
-        ? JSON.stringify({ repository, permissions })
+        ? JSON.stringify({ repository, permissions, ...(proxyDelivery && { delivery: proxyDelivery }) })
         : repositories
           ? JSON.stringify({ repositories, permissions })
           : "",
     },
     "token exchange",
   );
+  if (proxyDelivery) {
+    if (exchangeResponse.token !== undefined) {
+      if (typeof exchangeResponse.token === "string" && exchangeResponse.token.length > 0) {
+        addMask(exchangeResponse.token, write);
+        appendFileCommand(env.GITHUB_STATE, "token", exchangeResponse.token, appendFile, uuid);
+        if (typeof exchangeResponse.expires_at === "string" && exchangeResponse.expires_at.length > 0) {
+          appendFileCommand(env.GITHUB_STATE, "expiresAt", exchangeResponse.expires_at, appendFile, uuid);
+        }
+      }
+      throw new Error("proxy capability response unexpectedly contained an installation token");
+    }
+    const capability = requiredString(exchangeResponse.capability, "proxy capability");
+    if (
+      !/^[A-Za-z0-9_-]+$/u.test(capability) ||
+      capability.length > 8192
+    ) {
+      throw new Error("returned proxy capability is invalid");
+    }
+    const expiresAt = requiredString(exchangeResponse.expires_at, "proxy capability expiration");
+    const returnedRepository = requiredString(exchangeResponse.repository, "repository");
+    const returnedBranch = requiredString(exchangeResponse.branch, "proxy branch");
+    const returnedHead = requiredString(exchangeResponse.expected_old_oid, "proxy expected head");
+    const ref = requiredString(exchangeResponse.ref, "ref");
+    if (
+      returnedRepository !== repository ||
+      returnedBranch !== proxyDelivery.ref ||
+      returnedHead !== expectedHead
+    ) {
+      throw new Error("returned proxy capability does not match the requested scope");
+    }
+    for (const [name, value] of [
+      ["capability", capability],
+      ["expires-at", expiresAt],
+      ["repository", returnedRepository],
+      ["ref", ref],
+      ["branch", returnedBranch],
+      ["expected-head", returnedHead],
+    ]) {
+      appendFileCommand(env.GITHUB_OUTPUT, name, value, appendFile, uuid);
+    }
+    return;
+  }
+
   const token = requiredString(exchangeResponse.token, "installation token");
   addMask(token, write);
   appendFileCommand(env.GITHUB_STATE, "token", token, appendFile, uuid);

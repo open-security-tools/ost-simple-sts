@@ -38,7 +38,7 @@ function memoryFiles() {
   };
 }
 
-test("exchanges an OIDC token, masks credentials, and saves revocation state", async () => {
+test("exchanges an OIDC token under runner debug, masks credentials, and saves revocation state", async () => {
   const calls = [];
   const output = [];
   const { files, appendFile } = memoryFiles();
@@ -53,7 +53,7 @@ test("exchanges an OIDC token, masks credentials, and saves revocation state", a
   ];
 
   await runMain({
-    env: environment(),
+    env: environment({ RUNNER_DEBUG: "1" }),
     appendFile,
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
@@ -89,6 +89,290 @@ test("exchanges an OIDC token, masks credentials, and saves revocation state", a
   assert.match(files.get("outputs"), /ref<<ghadelimiter_test-delimiter\nrefs\/heads\/main/);
   assert.match(files.get("state"), /token<<ghadelimiter_test-delimiter\ninstallation%token\r\nmasked/);
   assert.match(files.get("state"), /expiresAt<<ghadelimiter_test-delimiter\n2026-07-15T20:00:00Z/);
+});
+
+test("rejects proxy delivery under runner debug before requesting OIDC credentials", async () => {
+  let called = false;
+  const output = [];
+  const { files, appendFile } = memoryFiles();
+
+  await assert.rejects(
+    runMain({
+      env: environment({
+        INPUT_DELIVERY: "github-proxy",
+        INPUT_BRANCH: "automation/fix-123",
+        "INPUT_EXPECTED-HEAD": "a".repeat(40),
+        RUNNER_DEBUG: "1",
+      }),
+      appendFile,
+      fetchImpl: async () => {
+        called = true;
+      },
+      write: (value) => output.push(value),
+    }),
+    /github-proxy delivery is disabled when RUNNER_DEBUG=1 because GitHub Actions debug logging may expose the proxy capability/u,
+  );
+
+  assert.equal(called, false);
+  assert.deepEqual(output, []);
+  assert.equal(files.size, 0);
+});
+
+test("issues a transferable exact-branch proxy capability without exposing or revoking a token", async () => {
+  const calls = [];
+  const output = [];
+  const { files, appendFile } = memoryFiles();
+  const expectedHead = "a".repeat(40);
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      capability: "encrypted_capability-123",
+      expires_at: expiresAt,
+      repository: "example/repository",
+      ref: "refs/heads/main",
+      branch: "refs/heads/automation/fix-123",
+      expected_old_oid: expectedHead,
+    }),
+  ];
+
+  await runMain({
+    env: environment({
+      INPUT_DELIVERY: "github-proxy",
+      INPUT_BRANCH: "automation/fix-123",
+      "INPUT_EXPECTED-HEAD": expectedHead,
+    }),
+    appendFile,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return responses.shift();
+    },
+    uuid: () => "test-delimiter",
+    write: (value) => output.push(value),
+  });
+
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    repository: "example/repository",
+    permissions: { contents: "write" },
+    delivery: {
+      kind: "github_proxy",
+      ref: "refs/heads/automation/fix-123",
+      expected_old_oid: expectedHead,
+    },
+  });
+  assert.deepEqual(output, ["::add-mask::oidc-token\n"]);
+  assert.equal(files.has("state"), false);
+  assert.match(files.get("outputs"), /capability<<ghadelimiter_test-delimiter\nencrypted_capability-123/u);
+  assert.match(files.get("outputs"), /branch<<ghadelimiter_test-delimiter\nrefs\/heads\/automation\/fix-123/u);
+  assert.doesNotMatch(files.get("outputs"), /\ntoken<</u);
+});
+
+test("accepts full branch references, maximum-length references, and SHA-256 expected heads", async () => {
+  for (const [branch, expectedHead] of [
+    ["refs/heads/automation/fix-123", "a".repeat(64)],
+    ["a".repeat(244), "b".repeat(40)],
+  ]) {
+    const calls = [];
+    const gitRef = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+    const responses = [
+      response({ value: "oidc-token" }),
+      response({
+        capability: "encrypted_capability-123",
+        expires_at: expiresAt,
+        repository: "example/repository",
+        ref: "refs/heads/main",
+        branch: gitRef,
+        expected_old_oid: expectedHead,
+      }),
+    ];
+
+    await runMain({
+      env: environment({
+        INPUT_DELIVERY: "github-proxy",
+        INPUT_BRANCH: branch,
+        "INPUT_EXPECTED-HEAD": expectedHead,
+      }),
+      appendFile: () => {},
+      fetchImpl: async (url, options) => {
+        calls.push({ url, options });
+        return responses.shift();
+      },
+      write: () => {},
+    });
+
+    assert.deepEqual(JSON.parse(calls[1].options.body).delivery, {
+      kind: "github_proxy",
+      ref: gitRef,
+      expected_old_oid: expectedHead,
+    });
+  }
+});
+
+test("rejects unsafe proxy delivery requests before obtaining OIDC credentials", async () => {
+  const validHead = "a".repeat(40);
+  for (const overrides of [
+    ...[
+      "",
+      "main",
+      "master",
+      "refs/heads/main",
+      ".hidden",
+      "refs/heads/.hidden",
+      "safe/.hidden",
+      "safe/../main",
+      "safe//nested",
+      "safe/",
+      "safe.",
+      "safe.lock",
+      "safe.lock/nested",
+      "-safe",
+      "safe+unexpected",
+      "safe@unexpected",
+      "safe\nbranch",
+      "a".repeat(245),
+    ].map((branch) => ({
+      INPUT_DELIVERY: "github-proxy",
+      INPUT_BRANCH: branch,
+      "INPUT_EXPECTED-HEAD": validHead,
+    })),
+    { INPUT_DELIVERY: "github-proxy", INPUT_BRANCH: "safe", "INPUT_EXPECTED-HEAD": "invalid" },
+    { INPUT_DELIVERY: "github-proxy", INPUT_BRANCH: "safe", "INPUT_EXPECTED-HEAD": "A".repeat(40) },
+    { INPUT_DELIVERY: "github-proxy", INPUT_BRANCH: "safe", "INPUT_EXPECTED-HEAD": validHead, INPUT_PERMISSIONS: "contents: write\npull_requests: write" },
+    { INPUT_DELIVERY: "github-proxy", INPUT_BRANCH: "safe", "INPUT_EXPECTED-HEAD": validHead, INPUT_PERMISSIONS: "contents: read" },
+    { INPUT_DELIVERY: "token", INPUT_BRANCH: "safe" },
+    { INPUT_DELIVERY: "token", "INPUT_EXPECTED-HEAD": validHead },
+    { INPUT_DELIVERY: "unexpected", INPUT_BRANCH: "safe", "INPUT_EXPECTED-HEAD": validHead },
+  ]) {
+    let called = false;
+    await assert.rejects(
+      runMain({
+        env: environment(overrides),
+        fetchImpl: async () => {
+          called = true;
+        },
+      }),
+    );
+    assert.equal(called, false);
+  }
+});
+
+test("rejects malformed or differently scoped proxy capabilities without emitting outputs", async () => {
+  const expectedHead = "a".repeat(40);
+  const validResponse = {
+    capability: "encrypted_capability-123",
+    expires_at: expiresAt,
+    repository: "example/repository",
+    ref: "refs/heads/main",
+    branch: "refs/heads/automation/fix-123",
+    expected_old_oid: expectedHead,
+  };
+
+  for (const invalidFields of [
+    { capability: undefined },
+    { capability: "" },
+    { capability: "encrypted=capability" },
+    { capability: "encrypted capability" },
+    { capability: "encrypted\ncapability" },
+    { capability: "a".repeat(8193) },
+    { expires_at: undefined },
+    { repository: "example/other" },
+    { branch: "refs/heads/automation/other" },
+    { expected_old_oid: "b".repeat(40) },
+    { ref: undefined },
+  ]) {
+    const output = [];
+    const { files, appendFile } = memoryFiles();
+    const responses = [
+      response({ value: "oidc-token" }),
+      response({ ...validResponse, ...invalidFields }),
+    ];
+
+    await assert.rejects(
+      runMain({
+        env: environment({
+          INPUT_DELIVERY: "github-proxy",
+          INPUT_BRANCH: "automation/fix-123",
+          "INPUT_EXPECTED-HEAD": expectedHead,
+        }),
+        appendFile,
+        fetchImpl: async () => responses.shift(),
+        uuid: () => "test-delimiter",
+        write: (value) => output.push(value),
+      }),
+      /invalid|does not match|was not returned/u,
+    );
+
+    assert.deepEqual(output, ["::add-mask::oidc-token\n"]);
+    assert.equal(files.has("outputs"), false);
+    assert.equal(files.has("state"), false);
+  }
+});
+
+test("accepts proxy capabilities at the 8192-character limit", async () => {
+  const expectedHead = "a".repeat(40);
+  const responses = [
+    response({ value: "oidc-token" }),
+    response({
+      capability: "a".repeat(8192),
+      expires_at: expiresAt,
+      repository: "example/repository",
+      ref: "refs/heads/main",
+      branch: "refs/heads/automation/fix-123",
+      expected_old_oid: expectedHead,
+    }),
+  ];
+
+  await runMain({
+    env: environment({
+      INPUT_DELIVERY: "github-proxy",
+      INPUT_BRANCH: "automation/fix-123",
+      "INPUT_EXPECTED-HEAD": expectedHead,
+    }),
+    appendFile: () => {},
+    fetchImpl: async () => responses.shift(),
+    write: () => {},
+  });
+});
+
+test("masks and schedules unexpected installation tokens in proxy responses for revocation", async () => {
+  const expectedHead = "a".repeat(40);
+
+  for (const invalidResponse of [
+    { capability: "encrypted_capability-123", token: "installation-token", expires_at: expiresAt },
+    { token: "installation-token", expires_at: expiresAt },
+    { capability: "encrypted_capability-123", token: "installation-token" },
+    { capability: "encrypted_capability-123", token: "installation-token", expires_at: 123 },
+  ]) {
+    const output = [];
+    const { files, appendFile } = memoryFiles();
+    const responses = [response({ value: "oidc-token" }), response(invalidResponse)];
+
+    await assert.rejects(
+      runMain({
+        env: environment({
+          INPUT_DELIVERY: "github-proxy",
+          INPUT_BRANCH: "automation/fix-123",
+          "INPUT_EXPECTED-HEAD": expectedHead,
+        }),
+        appendFile,
+        fetchImpl: async () => responses.shift(),
+        uuid: () => "test-delimiter",
+        write: (value) => output.push(value),
+      }),
+      /proxy capability response unexpectedly contained an installation token/u,
+    );
+
+    assert.deepEqual(output, [
+      "::add-mask::oidc-token\n",
+      "::add-mask::installation-token\n",
+    ]);
+    assert.match(files.get("state"), /token<<ghadelimiter_test-delimiter\ninstallation-token/u);
+    if (invalidResponse.expires_at === expiresAt) {
+      assert.match(files.get("state"), /expiresAt<<ghadelimiter_test-delimiter\n2026-07-15T20:00:00Z/u);
+    } else {
+      assert.doesNotMatch(files.get("state"), /\nexpiresAt<</u);
+    }
+    assert.equal(files.has("outputs"), false);
+  }
 });
 
 test("rejects an unsafe exchange URL before requesting an OIDC token", async () => {

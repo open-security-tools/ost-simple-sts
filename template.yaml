@@ -70,10 +70,15 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional SNS topic ARN for CloudWatch alarm notifications
+  ProxyCapabilityKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional KMS key ARN used to issue encrypted GitHub proxy capabilities
 
 Conditions:
   HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
   HasPolicyAudience: !Not [!Equals [!Ref PolicyAudience, '']]
+  HasProxyCapabilityKey: !Not [!Equals [!Ref ProxyCapabilityKmsKeyArn, '']]
 
 Resources:
   Api:
@@ -159,6 +164,7 @@ Resources:
           APP_ID_PARAMETER: !Ref AppIdParameterName
           APP_PRIVATE_KEY_SECRET_NAME: !Ref AppPrivateKeySecretName
           JTI_TABLE_NAME: !Ref JtiTableName
+          PROXY_CAPABILITY_KMS_KEY_ARN: !Ref ProxyCapabilityKmsKeyArn
           RUST_LOG: warn
       Policies:
         - Statement:
@@ -175,6 +181,16 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppPrivateKeySecretName}-??????
+            - !If
+              - HasProxyCapabilityKey
+              - Effect: Allow
+                Action: kms:Encrypt
+                Resource: !Ref ProxyCapabilityKmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:EncryptionContext:service: ost-github-proxy
+                    kms:EncryptionContext:version: '1'
+              - !Ref AWS::NoValue
 
   ApiIntegration:
     Type: AWS::ApiGatewayV2::Integration

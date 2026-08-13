@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, env, fmt, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
+use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
@@ -969,8 +970,15 @@ pub struct Config {
     pub jti_table_name: JtiTableName,
     pub github_api_base: GithubApiBase,
     pub dynamodb: DynamoDbClient,
+    pub proxy_capability: Option<ProxyCapabilityConfig>,
     pub http_client: reqwest::Client,
     pub jwks_cache: Arc<JwksCache>,
+}
+
+#[derive(Clone)]
+pub struct ProxyCapabilityConfig {
+    pub client: KmsClient,
+    pub key_id: String,
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -1011,6 +1019,13 @@ impl Config {
         let github_api_base = GithubApiBase::from_env()?;
         let http_client = build_http_client()?;
         let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
+        let proxy_capability = env::var("PROXY_CAPABILITY_KMS_KEY_ARN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|key_id| ProxyCapabilityConfig {
+                client: KmsClient::new(&shared_config),
+                key_id,
+            });
 
         Ok(Self {
             policy_location,
@@ -1021,6 +1036,7 @@ impl Config {
             jti_table_name,
             github_api_base,
             dynamodb: DynamoDbClient::new(&shared_config),
+            proxy_capability,
             http_client,
             jwks_cache,
         })

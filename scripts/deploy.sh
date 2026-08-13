@@ -18,6 +18,7 @@
 #   JTI_TABLE_NAME              DynamoDB table name for JTI replay guard
 # Optional .env variables:
 #   POLICY_AUDIENCE             Custom OIDC audience; defaults to the deployed API URL
+#   PROXY_CAPABILITY_KMS_KEY_ARN KMS key ARN enabling branch-scoped proxy capabilities
 #   ALARM_TOPIC_ARN             SNS topic ARN for CloudWatch alarm notifications
 #
 set -euo pipefail
@@ -81,9 +82,10 @@ sam deploy \
     "ParameterKey=PolicyInstallationId,ParameterValue=$POLICY_INSTALLATION_ID" \
     "ParameterKey=PolicyPath,ParameterValue=$POLICY_PATH" \
     "ParameterKey=PolicyRef,ParameterValue=$POLICY_REF" \
-    "ParameterKey=PolicyAudience,ParameterValue=${POLICY_AUDIENCE:-}" \
+    "ParameterKey=PolicyAudience,ParameterValue=\"${POLICY_AUDIENCE:-}\"" \
     "ParameterKey=AppPrivateKeySecretName,ParameterValue=$APP_PRIVATE_KEY_SECRET_NAME" \
     "ParameterKey=AppIdParameterName,ParameterValue=$APP_ID_PARAMETER" \
     "ParameterKey=JtiTableName,ParameterValue=$JTI_TABLE_NAME" \
+    "ParameterKey=ProxyCapabilityKmsKeyArn,ParameterValue=\"${PROXY_CAPABILITY_KMS_KEY_ARN:-}\"" \
     "ParameterKey=AlarmTopicArn,ParameterValue=\"${ALARM_TOPIC_ARN:-}\"" \
   "$@"

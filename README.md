@@ -52,6 +52,60 @@ requested target repository and list one GitHub App repository permission per li
 including after a failed step. Do not pass the token to another job. Pin actions to a commit SHA in
 production.
 
+### Branch-scoped GitHub proxy delivery
+
+GitHub App installation tokens cannot be restricted to individual branches. An approved workflow
+can instead request an encrypted capability for `ost-github-proxy`:
+
+```yaml
+- id: proxy
+  uses: open-security-tools/ost-simple-sts@<commit-sha>
+  with:
+    exchange-url: ${{ secrets.STS_API_URL }}/exchange
+    audience: ${{ secrets.STS_API_URL }}
+    repository: example-org/example-repo
+    permissions: |
+      contents: write
+    delivery: github-proxy
+    branch: automation/fix-123
+    expected-head: 0000000000000000000000000000000000000000
+```
+
+The existing OIDC and repository policy is enforced before the broker encrypts the installation
+token, target repository, branch, expected previous head, and expiration. The action returns only
+an opaque `capability`; use forty zeroes for a new branch or its trusted current SHA for an
+existing branch.
+
+Run the exchange in a trusted setup job with `id-token: write`. Pass its capability output only
+through an explicitly declared reusable-workflow secret:
+
+```yaml
+jobs:
+  agent:
+    needs: setup
+    uses: ./.github/workflows/proxy-agent.yml
+    permissions:
+      contents: read
+    secrets:
+      proxy_capability: ${{ needs.setup.outputs.capability }}
+```
+
+Declare `proxy_capability` under `on.workflow_call.secrets` and pass
+`${{ secrets.proxy_capability }}` to the proxy action. Direct action inputs, environment
+variables, and shell interpolation expose unmasked job outputs in GitHub logs; do not use those
+for the handoff or use `secrets: inherit`. Proxy delivery is disabled under `RUNNER_DEBUG=1`.
+
+The agent must not receive `id-token: write`; its proxy action revokes the installation token
+when the job ends. Only one repository and `contents: write` are accepted, and `main` and
+`master` are rejected. Pin setup to a protected default-branch workflow, derive its branch and
+expected head from trusted metadata, and never check out agent-controlled refs there.
+
+To enable the feature, set `PROXY_CAPABILITY_KMS_KEY_ARN` to the proxy stack's
+`CapabilityKeyArn` output before deploying this stack. The broker role receives only
+`kms:Encrypt`; the proxy role receives only `kms:Decrypt`. Existing raw-token exchanges are
+unchanged when no proxy key is configured. Deploy both stacks to the same AWS account and region;
+cross-account and cross-region KMS access is unsupported.
+
 ## GitHub App
 
 For the examples below, the GitHub App needs the following repository permissions:

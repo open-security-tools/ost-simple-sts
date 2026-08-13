@@ -17,10 +17,22 @@ inputs:
   permissions:
     description: Newline-delimited GitHub App repository permissions requested from the simple-sts policy.
     required: false
+  delivery:
+    description: Select token delivery or an encrypted github-proxy capability.
+    required: false
+    default: token
+  branch:
+    description: Exact branch authorized by github-proxy delivery.
+    required: false
+  expected-head:
+    description: Expected previous branch head, or forty zeroes for a new branch.
+    required: false
 
 outputs:
   token:
     description: Short-lived GitHub App installation token.
+  capability:
+    description: Encrypted, exact-branch GitHub proxy capability.
   expires-at:
     description: Expiration time reported by GitHub.
   repository:
@@ -29,6 +41,10 @@ outputs:
     description: Newline-delimited repositories authorized by a multi-repository exchange policy.
   ref:
     description: Git ref authorized by the exchange policy.
+  branch:
+    description: Exact branch authorized by a GitHub proxy capability.
+  expected-head:
+    description: Expected previous branch head authorized by a GitHub proxy capability.
 
 runs:
   using: node24
