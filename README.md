@@ -71,10 +71,17 @@ can instead request an encrypted capability for `ost-github-proxy`:
     expected-head: 0000000000000000000000000000000000000000
 ```
 
-The existing OIDC and repository policy is enforced before the broker encrypts the installation
-token, target repository, branch, expected previous head, and expiration. The action returns only
-an opaque `capability`; use forty zeroes for a new branch or its trusted current SHA for an
-existing branch.
+Require proxy-only delivery by adding a `proxy` constraint to the matching hosted policy rule:
+
+```json
+"proxy": { "branch_prefix": "refs/heads/automation/" }
+```
+
+This rule cannot issue raw tokens or authorize branches outside its configured namespace. It must
+target one repository with exactly `contents: write`; existing rules without `proxy` retain their
+current behavior. The broker encrypts the installation token, repository, branch, expected previous
+head, and expiration and returns only an opaque `capability`. Use forty zeroes for a new branch or
+its trusted current SHA for an existing branch.
 
 Run the exchange in a trusted setup job with `id-token: write`. Pass its capability output only
 through an explicitly declared reusable-workflow secret:

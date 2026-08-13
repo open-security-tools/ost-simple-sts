@@ -300,6 +300,15 @@ async fn verify_oidc_claims(
         )
     });
     let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
+    if let Some(proxy) = rule.proxy() {
+        let delivery = exchange_request
+            .as_ref()
+            .and_then(|request| request.delivery.as_ref())
+            .ok_or(AppError::ProxyDeliveryRequired)?;
+        if !proxy.permits(delivery.git_ref()) {
+            return Err(AppError::ProxyBranchNotAllowed);
+        }
+    }
     let target_repositories = rule.target_repositories();
 
     match exchange_request.as_ref() {
@@ -738,6 +747,23 @@ mod integration_tests {
             .unwrap()
         }
 
+        fn proxy_policy(&self) -> Policy {
+            serde_json::from_value(json!({
+                "expected_audience": self.server.uri(),
+                "rules": [{
+                    "subject": "repo:octo/tools:environment:release",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "environment": "release",
+                    "permissions": { "contents": "write" },
+                    "proxy": { "branch_prefix": "refs/heads/automation/" }
+                }]
+            }))
+            .unwrap()
+        }
+
         fn valid_claims(&self) -> serde_json::Value {
             let now = self.now_secs();
             json!({
@@ -779,6 +805,27 @@ mod integration_tests {
                 .header("content-type", "application/json")
                 .body(Body::Text(
                     json!({ "repository": repository, "permissions": permissions }).to_string(),
+                ))
+                .unwrap()
+        }
+
+        fn make_proxy_request(&self, token: &str, git_ref: &str) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::Text(
+                    json!({
+                        "repository": "octo/tools",
+                        "permissions": { "contents": "write" },
+                        "delivery": {
+                            "kind": "github_proxy",
+                            "ref": git_ref,
+                            "expected_old_oid": "a".repeat(40)
+                        }
+                    })
+                    .to_string(),
                 ))
                 .unwrap()
         }
@@ -875,24 +922,7 @@ mod integration_tests {
         let fixture = TestFixture::new().await;
         let config = fixture.build_config(fixture.policy());
         let token = fixture.sign_claims(fixture.valid_claims());
-        let request = Request::builder()
-            .method("POST")
-            .uri("/exchange")
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(Body::Text(
-                json!({
-                    "repository": "octo/tools",
-                    "permissions": { "contents": "write" },
-                    "delivery": {
-                        "kind": "github_proxy",
-                        "ref": "refs/heads/automation/fix",
-                        "expected_old_oid": "a".repeat(40)
-                    }
-                })
-                .to_string(),
-            ))
-            .unwrap();
+        let request = fixture.make_proxy_request(&token, "refs/heads/automation/fix");
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
         assert_eq!(verified.target_repository.as_str(), "octo/tools");
@@ -901,6 +931,65 @@ mod integration_tests {
             .unwrap()
             .delivery
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_rejects_raw_token_requests() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for request in [
+            fixture.make_request(&token),
+            fixture.make_scoped_request(&token, "octo/tools", json!({ "contents": "write" })),
+        ] {
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert!(matches!(error, AppError::ProxyDeliveryRequired));
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_accepts_branches_inside_its_namespace() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for git_ref in [
+            "refs/heads/automation/fix",
+            "refs/heads/automation/nested/fix",
+        ] {
+            let request = fixture.make_proxy_request(&token, git_ref);
+            let verified = verify_oidc_claims(&config, &request).await.unwrap();
+            assert_eq!(verified.target_repository.as_str(), "octo/tools");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_rejects_branches_outside_its_namespace() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for git_ref in [
+            "refs/heads/automation",
+            "refs/heads/automation-other/fix",
+            "refs/heads/other/fix",
+        ] {
+            let request = fixture.make_proxy_request(&token, git_ref);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert!(
+                matches!(error, AppError::ProxyBranchNotAllowed),
+                "{git_ref}"
+            );
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        }
+
+        let protected = fixture.make_proxy_request(&token, "refs/heads/main");
+        assert!(matches!(
+            verify_oidc_claims(&config, &protected).await,
+            Err(AppError::InvalidExchangeRequest)
+        ));
     }
 
     #[tokio::test]

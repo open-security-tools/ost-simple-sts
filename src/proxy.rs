@@ -65,6 +65,12 @@ struct CapabilityPlaintext<'a> {
 }
 
 impl ProxyDelivery {
+    pub fn git_ref(&self) -> &str {
+        match self {
+            Self::GithubProxy { git_ref, .. } => git_ref,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), AppError> {
         let Self::GithubProxy {
             git_ref,
@@ -131,7 +137,7 @@ pub async fn encrypt_capability(
     })
 }
 
-fn valid_branch_ref(value: &str) -> bool {
+pub(crate) fn valid_branch_ref(value: &str) -> bool {
     let Some(branch) = value.strip_prefix("refs/heads/") else {
         return false;
     };
