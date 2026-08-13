@@ -65,7 +65,6 @@ struct VerifiedClaims {
     git_ref: GitRef,
     jti: Jti,
     expires_at_ms: u64,
-    delivery: Option<ProxyDelivery>,
 }
 
 pub struct ExchangeResult {
@@ -83,7 +82,8 @@ pub enum ExchangeOutcome {
 
 pub async fn handle(config: Config, request: Request) -> Result<ExchangeOutcome, AppError> {
     let claims = verify_oidc_claims(&config, &request).await?;
-    if claims.delivery.is_some() && config.proxy_capability.is_none() {
+    let delivery = get_exchange_request(&request)?.and_then(|request| request.delivery);
+    if delivery.is_some() && config.proxy_capability.is_none() {
         return Err(AppError::ProxyCapabilityNotConfigured);
     }
 
@@ -97,7 +97,7 @@ pub async fn handle(config: Config, request: Request) -> Result<ExchangeOutcome,
     .await?;
 
     let result = mint_installation_token(&config, &claims).await?;
-    let Some(delivery) = &claims.delivery else {
+    let Some(delivery) = delivery.as_ref() else {
         return Ok(ExchangeOutcome::Token(result));
     };
     let capability_config = config
@@ -334,10 +334,6 @@ async fn verify_oidc_claims(
         .first()
         .cloned()
         .ok_or(AppError::TargetRepositoryNotAllowed)?;
-    let delivery = exchange_request
-        .as_ref()
-        .and_then(|request| request.delivery.clone());
-
     Ok(VerifiedClaims {
         target_repository,
         target_repository_id,
@@ -351,7 +347,6 @@ async fn verify_oidc_claims(
         git_ref: GitRef::try_from(git_ref).map_err(|_| AppError::RefNotAllowed)?,
         jti,
         expires_at_ms: exp.saturating_mul(1000) + CLOCK_TOLERANCE_SECONDS.saturating_mul(1000),
-        delivery,
     })
 }
 
@@ -901,7 +896,11 @@ mod integration_tests {
 
         let verified = verify_oidc_claims(&config, &request).await.unwrap();
         assert_eq!(verified.target_repository.as_str(), "octo/tools");
-        assert!(verified.delivery.is_some());
+        assert!(get_exchange_request(&request)
+            .unwrap()
+            .unwrap()
+            .delivery
+            .is_some());
     }
 
     #[tokio::test]
@@ -2013,7 +2012,6 @@ mod integration_tests {
             git_ref: "refs/heads/main".try_into().unwrap(),
             jti: "test-jti".try_into().unwrap(),
             expires_at_ms: 0,
-            delivery: None,
         };
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
@@ -2251,7 +2249,6 @@ mod integration_tests {
             git_ref: "refs/heads/main".try_into().unwrap(),
             jti: "test-jti".try_into().unwrap(),
             expires_at_ms: 0,
-            delivery: None,
         };
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
@@ -2301,7 +2298,6 @@ mod integration_tests {
             git_ref: "refs/heads/main".try_into().unwrap(),
             jti: "test-jti".try_into().unwrap(),
             expires_at_ms: 0,
-            delivery: None,
         };
 
         assert!(matches!(
