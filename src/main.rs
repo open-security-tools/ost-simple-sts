@@ -59,6 +59,7 @@ mod exchange;
 mod github;
 mod jwks;
 mod policy_cache;
+mod proxy;
 mod replay;
 mod response;
 #[cfg(test)]
@@ -90,13 +91,16 @@ async fn handle_request(config: config::Config, request: Request) -> Result<AppR
         (Method::GET, "/health") => Ok(AppResponse::health("ost-simple-sts")),
         (Method::POST, "/exchange") => {
             let result = exchange::handle(config, request).await?;
-            Ok(AppResponse::exchange(
-                result.token,
-                result.expires_at,
-                result.repository,
-                result.repositories,
-                result.git_ref,
-            ))
+            Ok(match result {
+                exchange::ExchangeOutcome::Token(result) => AppResponse::exchange(
+                    result.token,
+                    result.expires_at,
+                    result.repository,
+                    result.repositories,
+                    result.git_ref,
+                ),
+                exchange::ExchangeOutcome::Proxy(result) => AppResponse::proxy_capability(result),
+            })
         }
         _ => Err(AppError::NotFound),
     }
@@ -146,6 +150,7 @@ mod integration_tests {
                     ))
                     .build(),
             ),
+            proxy_capability: None,
             http_client,
             jwks_cache,
         }

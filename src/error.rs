@@ -54,6 +54,14 @@ pub enum AppError {
     RepositoryIdNotAllowed,
     #[error("exchange request is invalid")]
     InvalidExchangeRequest,
+    #[error("proxy capability delivery is not configured")]
+    ProxyCapabilityNotConfigured,
+    #[error("proxy delivery is required")]
+    ProxyDeliveryRequired,
+    #[error("proxy branch is not allowed")]
+    ProxyBranchNotAllowed,
+    #[error("proxy capability encryption failed")]
+    ProxyCapabilityEncryptionFailed,
     #[error("target repository is not allowed")]
     TargetRepositoryNotAllowed,
     #[error("target installation is not allowed")]
@@ -111,6 +119,10 @@ impl AppError {
             Self::RepositoryIdClaimInvalid => "repository_id_claim_invalid",
             Self::RepositoryIdNotAllowed => "repository_id_not_allowed",
             Self::InvalidExchangeRequest => "invalid_exchange_request",
+            Self::ProxyCapabilityNotConfigured => "proxy_capability_not_configured",
+            Self::ProxyDeliveryRequired => "proxy_delivery_required",
+            Self::ProxyBranchNotAllowed => "proxy_branch_not_allowed",
+            Self::ProxyCapabilityEncryptionFailed => "proxy_capability_encryption_failed",
             Self::TargetRepositoryNotAllowed => "target_repository_not_allowed",
             Self::TargetInstallationNotAllowed => "target_installation_not_allowed",
             Self::PermissionsNotAllowed => "permissions_not_allowed",
@@ -144,6 +156,7 @@ impl AppError {
             Self::OidcVerificationUnavailable | Self::JtiReplayGuardUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::ProxyCapabilityNotConfigured => StatusCode::NOT_IMPLEMENTED,
             Self::OidcTokenReplayed => StatusCode::CONFLICT,
             Self::RefNotAllowed
             | Self::EnvironmentNotAllowed
@@ -158,6 +171,8 @@ impl AppError {
             | Self::TargetRepositoryNotAllowed
             | Self::TargetInstallationNotAllowed
             | Self::PermissionsNotAllowed
+            | Self::ProxyDeliveryRequired
+            | Self::ProxyBranchNotAllowed
             | Self::AppNotInstalled
             | Self::InstallationNotFound => StatusCode::FORBIDDEN,
             Self::GithubAppAuthInvalid
@@ -166,6 +181,7 @@ impl AppError {
             Self::GithubInstallationLookupFailed
             | Self::GithubAccessTokenRequestFailed
             | Self::PolicyLookupFailed
+            | Self::ProxyCapabilityEncryptionFailed
             | Self::GithubRateLimited { .. } => StatusCode::BAD_GATEWAY,
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidExchangeRequest => StatusCode::BAD_REQUEST,

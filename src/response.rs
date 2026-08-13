@@ -2,12 +2,13 @@ use lambda_http::http::StatusCode;
 use lambda_http::{Body, Response};
 use serde::Serialize;
 
-use crate::{error::AppError, github::Token};
+use crate::{error::AppError, github::Token, proxy::ProxyCapabilityResult};
 
 #[derive(Debug)]
 pub(crate) enum AppResponse {
     Health(HealthResponse),
     Exchange(ExchangeResponse),
+    ProxyCapability(ProxyCapabilityResult),
 }
 
 impl AppResponse {
@@ -35,7 +36,12 @@ impl AppResponse {
         match self {
             Self::Health(body) => json_response(StatusCode::OK, &body),
             Self::Exchange(body) => json_response(StatusCode::OK, &body),
+            Self::ProxyCapability(body) => json_response(StatusCode::OK, &body),
         }
+    }
+
+    pub(crate) fn proxy_capability(capability: ProxyCapabilityResult) -> Self {
+        Self::ProxyCapability(capability)
     }
 }
 
@@ -111,7 +117,7 @@ mod tests {
     use serde_json::json;
 
     use super::AppResponse;
-    use crate::github::Token;
+    use crate::{github::Token, proxy::ProxyCapabilityResult};
 
     #[test]
     fn exchange_response_redacts_debug_and_serializes_token() {
@@ -167,5 +173,28 @@ mod tests {
                 "ref": "refs/heads/main"
             })
         );
+    }
+
+    #[test]
+    fn proxy_capability_response_redacts_debug_and_never_contains_a_github_token() {
+        let response = AppResponse::proxy_capability(ProxyCapabilityResult {
+            capability: "encrypted-session".to_owned().into(),
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+            repository: "octo/tools".to_owned(),
+            caller_ref: "refs/heads/main".to_owned(),
+            branch: "refs/heads/automation/fix".to_owned(),
+            expected_old_oid: "a".repeat(40),
+        });
+        assert!(!format!("{response:?}").contains("encrypted-session"));
+
+        let response = response.into_response();
+        let Body::Binary(body) = response.body() else {
+            panic!("expected JSON response body");
+        };
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+
+        assert_eq!(body["capability"], "encrypted-session");
+        assert_eq!(body["branch"], "refs/heads/automation/fix");
+        assert!(body.get("token").is_none());
     }
 }

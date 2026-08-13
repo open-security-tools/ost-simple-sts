@@ -1,5 +1,6 @@
 use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validation};
 use lambda_http::{http::header::AUTHORIZATION, Body, Request};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +8,7 @@ use crate::{
     config::{Config, GitRef, Policy},
     error::AppError,
     github::{self, Jti, Permissions, RepositoryFullName, RepositoryId},
+    proxy::{self, ProxyCapabilityResult, ProxyDelivery},
     replay,
 };
 
@@ -23,6 +25,8 @@ struct RawExchangeRequest {
     #[serde(default)]
     repositories: Option<Vec<String>>,
     permissions: Permissions,
+    #[serde(default)]
+    delivery: Option<ProxyDelivery>,
 }
 
 #[derive(Debug)]
@@ -30,6 +34,7 @@ struct ExchangeRequest {
     repositories: Vec<RepositoryFullName>,
     multiple: bool,
     permissions: Permissions,
+    delivery: Option<ProxyDelivery>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,8 +75,17 @@ pub struct ExchangeResult {
     pub git_ref: String,
 }
 
-pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, AppError> {
+pub enum ExchangeOutcome {
+    Token(ExchangeResult),
+    Proxy(ProxyCapabilityResult),
+}
+
+pub async fn handle(config: Config, request: Request) -> Result<ExchangeOutcome, AppError> {
     let claims = verify_oidc_claims(&config, &request).await?;
+    let delivery = get_exchange_request(&request)?.and_then(|request| request.delivery);
+    if delivery.is_some() && config.proxy_capability.is_none() {
+        return Err(AppError::ProxyCapabilityNotConfigured);
+    }
 
     replay::claim_jti(
         &config.dynamodb,
@@ -82,7 +96,74 @@ pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, 
     )
     .await?;
 
-    mint_installation_token(&config, &claims).await
+    let result = mint_installation_token(&config, &claims).await?;
+    let Some(delivery) = delivery.as_ref() else {
+        return Ok(ExchangeOutcome::Token(result));
+    };
+    let capability_config = config
+        .proxy_capability
+        .as_ref()
+        .ok_or(AppError::ProxyCapabilityNotConfigured)?;
+    match proxy::encrypt_capability(capability_config, &result, delivery).await {
+        Ok(capability) => Ok(ExchangeOutcome::Proxy(capability)),
+        Err(error) => {
+            if let Err(revocation_error) = revoke_failed_proxy_token(&config, &result.token).await {
+                revocation_error.warn();
+            }
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ProxyTokenRevocationError {
+    InvalidUrl,
+    Request(reqwest::Error),
+    UnexpectedStatus(StatusCode),
+}
+
+impl ProxyTokenRevocationError {
+    fn warn(&self) {
+        match self {
+            Self::InvalidUrl => {
+                tracing::warn!("failed to revoke an unissued proxy installation token")
+            }
+            Self::Request(error) => tracing::warn!(
+                error = %error,
+                "failed to revoke an unissued proxy installation token"
+            ),
+            Self::UnexpectedStatus(status) => tracing::warn!(
+                status = status.as_u16(),
+                "failed to revoke an unissued proxy installation token"
+            ),
+        }
+    }
+}
+
+async fn revoke_failed_proxy_token(
+    config: &Config,
+    token: &github::Token,
+) -> Result<(), ProxyTokenRevocationError> {
+    let url = config
+        .github_api_base
+        .as_url()
+        .join("installation/token")
+        .map_err(|_| ProxyTokenRevocationError::InvalidUrl)?;
+    let response = config
+        .http_client
+        .delete(url)
+        .bearer_auth(token.as_str())
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", "2022-11-28")
+        .send()
+        .await
+        .map_err(ProxyTokenRevocationError::Request)?;
+    if response.status() != StatusCode::NO_CONTENT {
+        return Err(ProxyTokenRevocationError::UnexpectedStatus(
+            response.status(),
+        ));
+    }
+    Ok(())
 }
 
 async fn verify_oidc_claims(
@@ -219,6 +300,15 @@ async fn verify_oidc_claims(
         )
     });
     let rule = rules.first().ok_or(AppError::WorkflowNotAllowed)?;
+    if let Some(proxy) = rule.proxy() {
+        let delivery = exchange_request
+            .as_ref()
+            .and_then(|request| request.delivery.as_ref())
+            .ok_or(AppError::ProxyDeliveryRequired)?;
+        if !proxy.permits(delivery.git_ref()) {
+            return Err(AppError::ProxyBranchNotAllowed);
+        }
+    }
     let authorized_repositories = rule.target_repositories();
 
     let target_repositories = match exchange_request.as_ref() {
@@ -261,7 +351,6 @@ async fn verify_oidc_claims(
         .first()
         .cloned()
         .ok_or(AppError::TargetRepositoryNotAllowed)?;
-
     Ok(VerifiedClaims {
         target_repository,
         target_repository_id,
@@ -360,6 +449,12 @@ fn get_exchange_request(request: &Request) -> Result<Option<ExchangeRequest>, Ap
     }
     let request = serde_json::from_slice::<RawExchangeRequest>(body)
         .map_err(|_| AppError::InvalidExchangeRequest)?;
+    if let Some(delivery) = &request.delivery {
+        delivery.validate()?;
+        if request.repositories.is_some() || request.permissions != Permissions::contents_write() {
+            return Err(AppError::InvalidExchangeRequest);
+        }
+    }
     let (repositories, multiple) = match (request.repository, request.repositories) {
         (Some(repository), None) => (vec![repository], false),
         (None, Some(repositories)) if repositories.len() >= 2 => (repositories, true),
@@ -382,6 +477,7 @@ fn get_exchange_request(request: &Request) -> Result<Option<ExchangeRequest>, Ap
         repositories,
         multiple,
         permissions: request.permissions,
+        delivery: request.delivery,
     }))
 }
 
@@ -526,6 +622,15 @@ mod tests {
         let multiple = get_exchange_request(&multiple).unwrap().unwrap();
         assert!(multiple.multiple);
         assert_eq!(multiple.repositories.len(), 2);
+
+        let delivery = Request::builder()
+            .body(Body::Text(format!(
+                r#"{{"repository":"octo/tools","permissions":{{"contents":"write"}},"delivery":{{"kind":"github_proxy","ref":"refs/heads/automation/fix","expected_old_oid":"{}"}}}}"#,
+                "a".repeat(40)
+            )))
+            .unwrap();
+        let delivery = get_exchange_request(&delivery).unwrap().unwrap();
+        assert!(delivery.delivery.is_some());
     }
 
     #[test]
@@ -545,6 +650,14 @@ mod tests {
                 .to_string(),
             r#"{"repositories":["octo/tools","../evil"],"permissions":{"contents":"write"}}"#
                 .to_string(),
+            format!(
+                r#"{{"repository":"octo/tools","permissions":{{"contents":"write"}},"delivery":{{"kind":"github_proxy","ref":"refs/heads/main","expected_old_oid":"{}"}}}}"#,
+                "a".repeat(40)
+            ),
+            format!(
+                r#"{{"repository":"octo/tools","permissions":{{"contents":"write","pull_requests":"write"}},"delivery":{{"kind":"github_proxy","ref":"refs/heads/safe","expected_old_oid":"{}"}}}}"#,
+                "a".repeat(40)
+            ),
             "x".repeat(MAX_EXCHANGE_REQUEST_BYTES + 1),
         ] {
             let request = Request::builder().body(Body::Text(body)).unwrap();
@@ -644,6 +757,23 @@ mod integration_tests {
             .unwrap()
         }
 
+        fn proxy_policy(&self) -> Policy {
+            serde_json::from_value(json!({
+                "expected_audience": self.server.uri(),
+                "rules": [{
+                    "subject": "repo:octo/tools:environment:release",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "environment": "release",
+                    "permissions": { "contents": "write" },
+                    "proxy": { "branch_prefix": "refs/heads/automation/" }
+                }]
+            }))
+            .unwrap()
+        }
+
         fn valid_claims(&self) -> serde_json::Value {
             let now = self.now_secs();
             json!({
@@ -689,6 +819,27 @@ mod integration_tests {
                 .unwrap()
         }
 
+        fn make_proxy_request(&self, token: &str, git_ref: &str) -> Request<Body> {
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::Text(
+                    json!({
+                        "repository": "octo/tools",
+                        "permissions": { "contents": "write" },
+                        "delivery": {
+                            "kind": "github_proxy",
+                            "ref": git_ref,
+                            "expected_old_oid": "a".repeat(40)
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+
         fn make_multi_scoped_request(
             &self,
             token: &str,
@@ -728,6 +879,7 @@ mod integration_tests {
                         ))
                         .build(),
                 ),
+                proxy_capability: None,
                 http_client,
                 jwks_cache,
             }
@@ -748,6 +900,137 @@ mod integration_tests {
         assert_eq!(verified.target_repository.as_str(), "octo/tools");
         assert_eq!(*verified.target_repository_id, 42);
         assert_eq!(verified.git_ref.as_str(), "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn reports_http_failure_after_attempting_proxy_token_revocation() {
+        let fixture = TestFixture::new().await;
+        Mock::given(method("DELETE"))
+            .and(path("/installation/token"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        let config = fixture.build_config(fixture.policy());
+        let token =
+            serde_json::from_value::<github::Token>(json!("sensitive-proxy-token")).unwrap();
+
+        let error = revoke_failed_proxy_token(&config, &token)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProxyTokenRevocationError::UnexpectedStatus(status)
+                if status == StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        fixture.server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn preserves_an_exact_branch_delivery_after_oidc_and_repository_verification() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+        let request = fixture.make_proxy_request(&token, "refs/heads/automation/fix");
+
+        let verified = verify_oidc_claims(&config, &request).await.unwrap();
+        assert_eq!(verified.target_repository.as_str(), "octo/tools");
+        assert!(get_exchange_request(&request)
+            .unwrap()
+            .unwrap()
+            .delivery
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_rejects_raw_token_requests() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for request in [
+            fixture.make_request(&token),
+            fixture.make_scoped_request(&token, "octo/tools", json!({ "contents": "write" })),
+        ] {
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert!(matches!(error, AppError::ProxyDeliveryRequired));
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_accepts_branches_inside_its_namespace() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for git_ref in [
+            "refs/heads/automation/fix",
+            "refs/heads/automation/nested/fix",
+        ] {
+            let request = fixture.make_proxy_request(&token, git_ref);
+            let verified = verify_oidc_claims(&config, &request).await.unwrap();
+            assert_eq!(verified.target_repository.as_str(), "octo/tools");
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_policy_rejects_branches_outside_its_namespace() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.proxy_policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+
+        for git_ref in [
+            "refs/heads/automation",
+            "refs/heads/automation-other/fix",
+            "refs/heads/other/fix",
+        ] {
+            let request = fixture.make_proxy_request(&token, git_ref);
+            let error = verify_oidc_claims(&config, &request).await.unwrap_err();
+            assert!(
+                matches!(error, AppError::ProxyBranchNotAllowed),
+                "{git_ref}"
+            );
+            assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        }
+
+        let protected = fixture.make_proxy_request(&token, "refs/heads/main");
+        assert!(matches!(
+            verify_oidc_claims(&config, &protected).await,
+            Err(AppError::InvalidExchangeRequest)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_proxy_delivery_before_claiming_replay_state_when_kms_is_not_configured() {
+        let fixture = TestFixture::new().await;
+        let config = fixture.build_config(fixture.policy());
+        let token = fixture.sign_claims(fixture.valid_claims());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/exchange")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::Text(
+                json!({
+                    "repository": "octo/tools",
+                    "permissions": { "contents": "write" },
+                    "delivery": {
+                        "kind": "github_proxy",
+                        "ref": "refs/heads/automation/fix",
+                        "expected_old_oid": "a".repeat(40)
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let error = match handle(config, request).await {
+            Ok(_) => panic!("proxy delivery must not succeed without a configured KMS key"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::ProxyCapabilityNotConfigured));
     }
 
     #[tokio::test]

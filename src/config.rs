@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, env, fmt, sync::Arc, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
+use aws_sdk_kms::Client as KmsClient;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use lambda_http::Error;
@@ -13,6 +14,7 @@ use crate::{
     github::{GithubApiBase, Permissions, RepositoryFullName, RepositoryId},
     jwks::JwksCache,
     policy_cache::PolicyCache,
+    proxy::valid_branch_ref,
 };
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
@@ -41,6 +43,12 @@ pub struct PolicyRule {
     target: Option<RepositoryTarget>,
     targets: Option<Vec<RepositoryTarget>>,
     target_installation_id: Option<u64>,
+    proxy: Option<ProxyPolicy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyPolicy {
+    branch_prefix: BranchPrefix,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +117,8 @@ struct RawPolicyRuleV2 {
     targets: Option<Vec<String>>,
     #[serde(default)]
     installation: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_proxy_policy")]
+    proxy: Option<RawProxyPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +146,21 @@ struct RawPolicyRule {
     target_repositories: Option<Vec<RawRepositoryTarget>>,
     #[serde(default)]
     target_installation_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_proxy_policy")]
+    proxy: Option<RawProxyPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProxyPolicy {
+    branch_prefix: String,
+}
+
+fn deserialize_proxy_policy<'de, D>(deserializer: D) -> Result<Option<RawProxyPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RawProxyPolicy::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +178,9 @@ pub struct Subject(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRef(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BranchPrefix(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkflowPath(String);
@@ -546,6 +574,16 @@ impl PolicyRule {
     pub fn target_installation_id(&self) -> Option<u64> {
         self.target_installation_id
     }
+
+    pub fn proxy(&self) -> Option<&ProxyPolicy> {
+        self.proxy.as_ref()
+    }
+}
+
+impl ProxyPolicy {
+    pub fn permits(&self, git_ref: &str) -> bool {
+        git_ref.starts_with(&self.branch_prefix.0)
+    }
 }
 
 impl std::str::FromStr for Policy {
@@ -667,6 +705,26 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             return Err(AppError::InvalidPolicy);
         }
 
+        let permissions = raw.permissions.unwrap_or_else(Permissions::contents_write);
+        let proxy = raw
+            .proxy
+            .map(|proxy| {
+                if targets.is_some() || permissions != Permissions::contents_write() {
+                    return Err(AppError::InvalidPolicy);
+                }
+                let branch = proxy
+                    .branch_prefix
+                    .strip_suffix('/')
+                    .ok_or(AppError::InvalidPolicy)?;
+                if !valid_branch_ref(branch) {
+                    return Err(AppError::InvalidPolicy);
+                }
+                Ok(ProxyPolicy {
+                    branch_prefix: BranchPrefix(proxy.branch_prefix),
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             subject: raw.subject.try_into()?,
             repository: raw
@@ -679,10 +737,11 @@ impl TryFrom<RawPolicyRule> for PolicyRule {
             job_workflow_path: raw.job_workflow_path.map(TryInto::try_into).transpose()?,
             environment: raw.environment.map(TryInto::try_into).transpose()?,
             allowed_events,
-            permissions: raw.permissions.unwrap_or_else(Permissions::contents_write),
+            permissions,
             target,
             targets,
             target_installation_id: raw.target_installation_id,
+            proxy,
         })
     }
 }
@@ -821,6 +880,7 @@ impl RawHostedPolicyV2 {
                 target_repository_id: target.map(|repository| repository.id),
                 target_repositories: targets,
                 target_installation_id: installation,
+                proxy: rule.proxy,
             });
         }
 
@@ -969,8 +1029,15 @@ pub struct Config {
     pub jti_table_name: JtiTableName,
     pub github_api_base: GithubApiBase,
     pub dynamodb: DynamoDbClient,
+    pub proxy_capability: Option<ProxyCapabilityConfig>,
     pub http_client: reqwest::Client,
     pub jwks_cache: Arc<JwksCache>,
+}
+
+#[derive(Clone)]
+pub struct ProxyCapabilityConfig {
+    pub client: KmsClient,
+    pub key_id: String,
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
@@ -1011,6 +1078,13 @@ impl Config {
         let github_api_base = GithubApiBase::from_env()?;
         let http_client = build_http_client()?;
         let jwks_cache = Arc::new(JwksCache::new(http_client.clone()));
+        let proxy_capability = env::var("PROXY_CAPABILITY_KMS_KEY_ARN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|key_id| ProxyCapabilityConfig {
+                client: KmsClient::new(&shared_config),
+                key_id,
+            });
 
         Ok(Self {
             policy_location,
@@ -1021,6 +1095,7 @@ impl Config {
             jti_table_name,
             github_api_base,
             dynamodb: DynamoDbClient::new(&shared_config),
+            proxy_capability,
             http_client,
             jwks_cache,
         })
@@ -1097,6 +1172,197 @@ mod tests {
             serde_json::to_value(policy.rules()[1].permissions()).unwrap(),
             json!({ "contents": "write", "pull_requests": "read" })
         );
+    }
+
+    #[test]
+    fn policy_validates_proxy_branch_namespaces() {
+        fn policy(proxy: serde_json::Value) -> Result<Policy, serde_json::Error> {
+            serde_json::from_value(json!({
+                "expected_audience": "https://example.com",
+                "rules": [{
+                    "subject": "repo:octo/tools:environment:release",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "environment": "release",
+                    "permissions": { "contents": "write" },
+                    "proxy": proxy
+                }]
+            }))
+        }
+
+        for prefix in [
+            "refs/heads/automation/",
+            "refs/heads/automation/fixes/",
+            "refs/heads/automation/fix-123_v2/",
+        ] {
+            let rule = policy(json!({ "branch_prefix": prefix })).unwrap();
+            assert!(rule.rules()[0].proxy().is_some(), "{prefix}");
+        }
+
+        let oversized = format!("refs/heads/{}/", "a".repeat(245));
+        for prefix in [
+            "",
+            "refs/heads/",
+            "refs/heads/automation",
+            "refs/tags/automation/",
+            "heads/automation/",
+            "refs/heads//automation/",
+            "refs/heads/automation//",
+            "refs/heads/.automation/",
+            "refs/heads/automation.lock/",
+            "refs/heads/automation/../",
+            "refs/heads/-automation/",
+            "refs/heads/automation /",
+            "refs/heads/autom*tion/",
+            "refs/heads/automatión/",
+            oversized.as_str(),
+        ] {
+            assert!(
+                policy(json!({ "branch_prefix": prefix })).is_err(),
+                "accepted invalid prefix: {prefix}"
+            );
+        }
+
+        for proxy in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({ "branch_prefix": 42 }),
+            json!({ "branch_prefix": "refs/heads/automation/", "extra": true }),
+        ] {
+            assert!(policy(proxy.clone()).is_err(), "accepted proxy: {proxy}");
+        }
+    }
+
+    #[test]
+    fn proxy_policy_rejects_multiple_targets_and_broad_permissions() {
+        for (permissions, targets) in [
+            (
+                json!({ "contents": "write", "pull_requests": "write" }),
+                None,
+            ),
+            (json!({ "contents": "read" }), None),
+            (
+                json!({ "contents": "write" }),
+                Some(json!([
+                    { "repository": "octo/tools", "repository_id": 42 },
+                    { "repository": "octo/tools-dev", "repository_id": 84 }
+                ])),
+            ),
+        ] {
+            let mut rule = json!({
+                "subject": "repo:octo/tools:environment:release",
+                "repository": "octo/tools",
+                "repository_id": 42,
+                "ref": "refs/heads/main",
+                "workflow_path": ".github/workflows/release.yml",
+                "environment": "release",
+                "permissions": permissions,
+                "proxy": { "branch_prefix": "refs/heads/automation/" }
+            });
+            if let Some(targets) = targets {
+                rule["target_repositories"] = targets;
+                rule["target_installation_id"] = json!(7);
+            }
+
+            let policy = serde_json::from_value::<Policy>(json!({
+                "expected_audience": "https://example.com",
+                "rules": [rule]
+            }));
+            assert!(policy.is_err());
+        }
+    }
+
+    #[test]
+    fn hosted_policy_versions_preserve_proxy_constraints() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let v1 = Policy::from_hosted(
+            &json!({
+                "version": 1,
+                "rules": [{
+                    "subject": "repo:octo/tools:ref:refs/heads/main",
+                    "repository": "octo/tools",
+                    "repository_id": 42,
+                    "ref": "refs/heads/main",
+                    "workflow_path": ".github/workflows/release.yml",
+                    "permissions": { "contents": "write" },
+                    "proxy": { "branch_prefix": "refs/heads/automation/" }
+                }]
+            })
+            .to_string(),
+            &audience,
+        )
+        .unwrap();
+        let v2 = Policy::from_hosted(
+            &json!({
+                "version": 2,
+                "repositories": {
+                    "tools": {
+                        "name": "octo/tools",
+                        "id": 42,
+                        "oidc_subject": "legacy"
+                    }
+                },
+                "rules": [{
+                    "caller": "tools",
+                    "caller_workflow": "release.yml",
+                    "on": ["workflow_dispatch"],
+                    "permissions": { "contents": "write" },
+                    "proxy": { "branch_prefix": "refs/heads/automation/" }
+                }]
+            })
+            .to_string(),
+            &audience,
+        )
+        .unwrap();
+
+        assert_eq!(v1, v2);
+        let proxy = v2.rules()[0].proxy().unwrap();
+        assert!(proxy.permits("refs/heads/automation/fix"));
+        assert!(proxy.permits("refs/heads/automation/nested/fix"));
+        assert!(!proxy.permits("refs/heads/automation"));
+        assert!(!proxy.permits("refs/heads/automation-other/fix"));
+        assert!(!proxy.permits("refs/heads/main"));
+    }
+
+    #[test]
+    fn hosted_policy_rejects_null_or_ambiguous_proxy_constraints() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        for (version, proxy) in [
+            (1, "null"),
+            (2, "null"),
+            (
+                1,
+                r#"{"branch_prefix":"refs/heads/automation/","extra":true}"#,
+            ),
+            (
+                2,
+                r#"{"branch_prefix":"refs/heads/automation/","extra":true}"#,
+            ),
+            (
+                1,
+                r#"{"branch_prefix":"refs/heads/automation/","branch_prefix":"refs/heads/other/"}"#,
+            ),
+            (
+                2,
+                r#"{"branch_prefix":"refs/heads/automation/","branch_prefix":"refs/heads/other/"}"#,
+            ),
+        ] {
+            let policy = if version == 1 {
+                format!(
+                    r#"{{"version":1,"rules":[{{"subject":"repo:octo/tools:ref:refs/heads/main","repository":"octo/tools","repository_id":42,"ref":"refs/heads/main","workflow_path":".github/workflows/release.yml","proxy":{proxy}}}]}}"#
+                )
+            } else {
+                format!(
+                    r#"{{"version":2,"repositories":{{"tools":{{"name":"octo/tools","id":42,"oidc_subject":"legacy"}}}},"rules":[{{"caller":"tools","caller_workflow":"release.yml","on":["workflow_dispatch"],"permissions":{{"contents":"write"}},"proxy":{proxy}}}]}}"#
+                )
+            };
+            assert!(
+                Policy::from_hosted(&policy, &audience).is_err(),
+                "accepted version {version} proxy: {proxy}"
+            );
+        }
     }
 
     #[test]
@@ -1363,6 +1629,30 @@ mod tests {
         }));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn policy_rejects_overlapping_proxy_and_raw_token_rules() {
+        let raw = json!({
+            "subject": "repo:octo/tools:environment:automations",
+            "repository": "octo/tools",
+            "repository_id": 42,
+            "ref": "refs/heads/main",
+            "workflow_path": ".github/workflows/release.yml",
+            "environment": "automations",
+            "allowed_events": ["workflow_dispatch"],
+            "permissions": { "contents": "write" }
+        });
+        let mut proxy = raw.clone();
+        proxy["proxy"] = json!({ "branch_prefix": "refs/heads/automation/" });
+
+        for rules in [[raw.clone(), proxy.clone()], [proxy, raw]] {
+            let policy = serde_json::from_value::<Policy>(json!({
+                "expected_audience": "https://example.com",
+                "rules": rules
+            }));
+            assert!(policy.is_err());
+        }
     }
 
     #[test]
