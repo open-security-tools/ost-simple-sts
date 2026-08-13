@@ -173,16 +173,18 @@ no environment is set), so callers cannot accidentally mix the two formats.
 Each rule names a `caller`, a `caller_workflow` filename under `.github/workflows`, a non-empty `on`
 event list, and an explicit `permissions` ceiling. `caller_ref` defaults to `refs/heads/main`; set
 `reusable_workflow` when the token is requested by a reusable workflow so its `job_workflow_ref`
-must match as well. `on` can contain only `issues`, `push`, `pull_request`, `schedule`, and
-`workflow_dispatch`; empty or duplicate event lists are rejected. Requests can select a subset or
-lower permission level, but never an additional or broader permission.
+must match as well. `on` can contain only `issue_comment`, `issues`, `push`, `pull_request`,
+`schedule`, and `workflow_dispatch`; empty or duplicate event lists are rejected. Requests can
+select a subset or lower permission level, but never an additional or broader permission.
 
-`target` names one repository alias. A multi-repository rule instead sets `targets` to an exact
-list of at least two aliases and `installation` to an alias in the top-level `installations` map.
-Singular and plural targets are mutually exclusive, and an explicit target always requires an
-explicit matching exchange request, even when it is the caller repository. Unknown fields and
-aliases, duplicate repository names or IDs, duplicate permissions, and overlapping identity rules
-are rejected so a later target or permission grant cannot be silently shadowed.
+`target` names one repository alias. A multi-repository rule instead sets `targets` to a list of at
+least two authorized aliases and `installation` to an alias in the top-level `installations` map.
+A request can select one authorized target with `repository` or a subset of at least two with
+`repositories`; the issued token is scoped only to the requested repositories. Singular and plural
+targets are mutually exclusive, and an explicit target always requires an explicit matching
+exchange request, even when it is the caller repository. Unknown fields and aliases, duplicate
+repository names or IDs, duplicate permissions, and overlapping identity rules are rejected so a
+later target or permission grant cannot be silently shadowed.
 
 For `pull_request` runs, set `caller_ref` to `refs/pull/*/merge` to match only canonical
 pull-request merge refs. This pattern is valid only with `on: ["pull_request"]`.

@@ -265,7 +265,7 @@ fn is_valid_alias(value: &str) -> bool {
 fn is_valid_event_name(value: &str) -> bool {
     matches!(
         value,
-        "issues" | "push" | "pull_request" | "schedule" | "workflow_dispatch"
+        "issue_comment" | "issues" | "push" | "pull_request" | "schedule" | "workflow_dispatch"
     )
 }
 
@@ -1760,6 +1760,39 @@ mod tests {
     }
 
     #[test]
+    fn hosted_policy_v2_accepts_a_scoped_issue_comment_rule() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let document = json!({
+            "version": 2,
+            "repositories": {
+                "uv": {
+                    "name": "astral-sh/uv",
+                    "id": 699532645,
+                    "oidc_subject": "legacy"
+                },
+                "uv-dev": {
+                    "name": "astral-sh/uv-dev",
+                    "id": 1302176231,
+                    "oidc_subject": "legacy"
+                }
+            },
+            "rules": [{
+                "caller": "uv",
+                "environment": "automations",
+                "caller_workflow": "update-issue-context.yml",
+                "on": ["issue_comment"],
+                "permissions": {"contents": "write"},
+                "target": "uv-dev"
+            }]
+        });
+        let policy = Policy::from_hosted(&document.to_string(), &audience).unwrap();
+
+        let rule = &policy.rules()[0];
+        assert_eq!(rule.allowed_events()[0].as_str(), "issue_comment");
+        assert_eq!(rule.target_repository().as_str(), "astral-sh/uv-dev");
+    }
+
+    #[test]
     fn hosted_policy_v2_accepts_schedule_events() {
         let audience = Audience::try_from("https://example.com").unwrap();
         let policy = Policy::from_hosted(
@@ -1887,9 +1920,11 @@ mod tests {
     #[test]
     fn policy_rejects_non_pull_request_events_for_a_pull_request_ref_pattern() {
         for allowed_events in [
+            json!(["issue_comment"]),
             json!(["push"]),
             json!(["schedule"]),
             json!(["workflow_dispatch"]),
+            json!(["pull_request", "issue_comment"]),
             json!(["pull_request", "push"]),
         ] {
             let result: Result<Policy, _> = serde_json::from_value(json!({

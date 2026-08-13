@@ -55,11 +55,12 @@ not-before, and issued-at claims. The caller's `workflow_ref` must match the sel
 repository, workflow path, and ref. If the job runs in a reusable workflow, its
 `job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
 reusable workflow. The event must be listed in the matched rule's `on` list. If a target
-repository or target set is configured, the request body is required and must exactly match that
-target. Singular and plural requests cannot be mixed. Installation lookup and token minting use only
-the matched targets and never an implicit calling repository; every plural target must resolve to
-the rule's pinned installation ID, and the repositories returned by GitHub must exactly match the
-configured names and IDs. A legacy empty body remains supported for same-repository rules.
+repository or target set is configured, the request body is required and must select only
+repositories authorized by that rule. Singular and plural requests cannot be mixed. Installation
+lookup and token minting use only the requested targets and never an implicit calling repository;
+every target must resolve to the rule's pinned installation ID, and the repositories returned by
+GitHub must exactly match the requested names and IDs. A legacy empty body remains supported for
+same-repository rules.
 Requested repository permissions must be a subset of the matching rule's configured permissions.
 The service rejects unknown, duplicate, or broader permissions.
 
