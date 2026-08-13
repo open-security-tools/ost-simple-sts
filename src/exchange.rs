@@ -973,7 +973,7 @@ mod integration_tests {
                 "ref": "refs/heads/main",
                 "workflow_path": ".github/workflows/release.yml",
                 "environment": "release",
-                "allowed_events": ["push", "schedule", "workflow_dispatch"],
+                "allowed_events": ["issue_comment", "push", "schedule", "workflow_dispatch"],
                 "permissions": { "contents": "write" },
                 "target_repository": "octo/tools-dev",
                 "target_repository_id": 84
@@ -982,7 +982,7 @@ mod integration_tests {
         .unwrap();
         let config = fixture.build_config(policy);
 
-        for event in ["push", "schedule", "workflow_dispatch"] {
+        for event in ["issue_comment", "push", "schedule", "workflow_dispatch"] {
             let mut claims = fixture.valid_claims();
             claims["event_name"] = json!(event);
             let token = fixture.sign_claims(claims);
@@ -1260,6 +1260,7 @@ mod integration_tests {
             ),
             ("job_workflow_ref", json!(null), "workflow_not_allowed"),
             ("environment", json!("release"), "environment_not_allowed"),
+            ("event_name", json!("issue_comment"), "event_not_allowed"),
             ("event_name", json!("push"), "event_not_allowed"),
         ] {
             let mut claims = valid_claims.clone();
