@@ -1,4 +1,4 @@
-.PHONY: fmt test build sam-build deploy deploy-secrets
+.PHONY: fmt test build sam-build
 
 fmt:
 	cargo fmt
@@ -11,9 +11,3 @@ build:
 
 sam-build:
 	sam build --beta-features --no-use-container
-
-deploy:
-	./scripts/deploy.sh
-
-deploy-secrets:
-	./scripts/deploy-secrets.sh

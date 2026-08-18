@@ -151,23 +151,34 @@ an exchange.
 
 ## Deploy
 
-Create the local configuration, set the policy repository identity, and set the App ID and
-private-key location in `.env`. The OIDC audience defaults to the deployed API URL; set
-`POLICY_AUDIENCE` only when using a custom HTTPS endpoint. Commit the policy to the trusted
-repository before deploying:
+Provision the GitHub App ID in SSM Parameter Store and its PEM private key in Secrets Manager
+through your deployment environment's normal secret-management process. Commit the policy to the
+trusted repository first. Deploy a reviewed release from the AWS Serverless Application Repository,
+or build a checked-out release and deploy it explicitly:
 
 ```bash
-cp .env.example .env
-mkdir -p .secrets
-# place the App PEM at .secrets/github-app-private-key.pem
-make deploy-secrets
-make deploy
+sam build --beta-features --no-use-container
+sam deploy --beta-features \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name ost-simple-sts --resolve-s3 \
+  --capabilities CAPABILITY_IAM --confirm-changeset \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+    PolicyRepository=example-org/example-repo \
+    PolicyRepositoryId=789012 PolicyInstallationId=345678 \
+    AppIdParameterName=/ost/app-id \
+    AppPrivateKeySecretName=ost/github-app-private-key
 ```
 
-The stack provisions the exchange API, Lambda, replay protection, logging, and alarms. The App ID
-and private key are stored in AWS; the policy rules remain in the trusted repository. Deployment
-settings can be overridden in `.env`;
-`ENV_FILE=/path/to/.env make deploy` selects another environment file.
+Replace the example identities and resource names. Review the proposed IAM and resource changes
+before confirming. The command receives secret resource names, not private-key contents. The
+OIDC audience defaults to the deployed API URL; set `PolicyAudience` only for a custom HTTPS
+endpoint. `PolicyPath`, `PolicyRef`, `JtiTableName`, and `AlarmTopicArn` are additional template
+parameters. An intentionally non-interactive deployment pipeline may use `--no-confirm-changeset`
+after its own approval gate; retain `--no-fail-on-empty-changeset` for unchanged deployments.
+
+The stack provisions the exchange API, Lambda, replay protection, and logging. The App ID and
+private key stay in AWS; policy rules stay in the trusted repository.
 
 ## How it works
 
