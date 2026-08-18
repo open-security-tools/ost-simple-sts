@@ -762,10 +762,23 @@ impl RawHostedPolicyV2 {
                     return Err(AppError::InvalidPolicy);
                 }
             };
-            let subject = rule.environment.as_ref().map_or_else(
-                || format!("{subject_prefix}:ref:{}", rule.caller_ref),
-                |environment| format!("{subject_prefix}:environment:{environment}"),
-            );
+            let subject = if let Some(environment) = &rule.environment {
+                format!(
+                    "{subject_prefix}:environment:{}",
+                    environment.replace(':', "%3A")
+                )
+            } else if rule.on.iter().any(|event| event == "pull_request") {
+                // One derived subject cannot represent both PR and non-PR jobs.
+                if rule.on.len() != 1 {
+                    return Err(AppError::InvalidPolicy);
+                }
+                format!("{subject_prefix}:pull_request")
+            } else {
+                format!(
+                    "{subject_prefix}:ref:{}",
+                    rule.caller_ref.replace(':', "%3A")
+                )
+            };
 
             let target = rule
                 .target
@@ -1034,6 +1047,58 @@ mod tests {
         WorkflowPath,
     };
     use serde_json::json;
+
+    #[test]
+    fn hosted_v2_derives_github_subject_contexts() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        for (format, owner, prefix) in [
+            ("legacy", None, "repo:octo/tools"),
+            ("immutable", Some(7), "repo:octo@7/tools@42"),
+        ] {
+            let mut repository = json!({"name":"octo/tools", "id":42, "oidc_subject":format});
+            if let Some(owner) = owner {
+                repository["owner_id"] = json!(owner);
+            }
+            for (environment, events, git_ref, suffix) in [
+                (
+                    None,
+                    json!(["pull_request"]),
+                    "refs/pull/*/merge",
+                    ":pull_request",
+                ),
+                (
+                    Some("Production:V1"),
+                    json!(["pull_request"]),
+                    "refs/pull/17/merge",
+                    ":environment:Production%3AV1",
+                ),
+                (
+                    None,
+                    json!(["push"]),
+                    "refs/heads/main",
+                    ":ref:refs/heads/main",
+                ),
+            ] {
+                let mut rule = json!({"caller":"tools", "caller_workflow":"ci.yml",
+                    "caller_ref":git_ref, "on":events, "permissions":{"contents":"read"}});
+                if let Some(environment) = environment {
+                    rule["environment"] = json!(environment);
+                }
+                let document =
+                    json!({"version":2,"repositories":{"tools":repository},"rules":[rule]});
+                let policy = Policy::from_hosted(&document.to_string(), &audience).unwrap();
+                assert_eq!(
+                    policy.rules()[0].subject().as_str(),
+                    format!("{prefix}{suffix}")
+                );
+            }
+        }
+        let document = json!({"version":2,"repositories":{"tools":{
+            "name":"octo/tools","id":42,"oidc_subject":"legacy"}},"rules":[{
+            "caller":"tools","caller_workflow":"ci.yml","on":["push","pull_request"],
+            "permissions":{"contents":"read"}}]});
+        assert!(Policy::from_hosted(&document.to_string(), &audience).is_err());
+    }
 
     #[test]
     fn policy_deserializes_into_validated_types() {
