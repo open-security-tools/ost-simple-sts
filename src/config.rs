@@ -573,7 +573,7 @@ impl TryFrom<RawPolicy> for Policy {
                 previous.subject == rule.subject
                     && previous.repository == rule.repository
                     && previous.repository_id == rule.repository_id
-                    && previous.git_ref == rule.git_ref
+                    && previous.git_ref.overlaps(&rule.git_ref)
                     && previous.workflow_path == rule.workflow_path
                     && previous.job_workflow_path == rule.job_workflow_path
                     && previous.environment == rule.environment
@@ -832,6 +832,10 @@ impl RawHostedPolicyV2 {
 }
 
 impl GitRef {
+    fn overlaps(&self, other: &Self) -> bool {
+        self == other || self.matches(other.as_str()) || other.matches(self.as_str())
+    }
+
     pub fn matches(&self, value: &str) -> bool {
         if self.as_str() == "refs/pull/*/merge" {
             is_pull_request_merge_ref(value)
@@ -1034,6 +1038,30 @@ mod tests {
         WorkflowPath,
     };
     use serde_json::json;
+
+    #[test]
+    fn policy_rejects_semantically_overlapping_pull_request_refs() {
+        let wildcard = json!({
+            "subject":"repo:octo/tools:environment:review", "repository":"octo/tools",
+            "repository_id":42, "ref":"refs/pull/*/merge",
+            "workflow_path":".github/workflows/review.yml", "environment":"review",
+            "allowed_events":["pull_request"], "permissions":{"pull_requests":"write"}
+        });
+        let mut exact = wildcard.clone();
+        exact["ref"] = json!("refs/pull/17/merge");
+        for rules in [json!([wildcard, exact]), json!([exact, wildcard])] {
+            assert!(serde_json::from_value::<Policy>(json!({
+                "expected_audience":"https://example.com", "rules":rules
+            }))
+            .is_err());
+        }
+        let mut distinct = exact.clone();
+        distinct["ref"] = json!("refs/pull/18/merge");
+        assert!(serde_json::from_value::<Policy>(json!({
+            "expected_audience":"https://example.com", "rules":[exact,distinct]
+        }))
+        .is_ok());
+    }
 
     #[test]
     fn policy_deserializes_into_validated_types() {
