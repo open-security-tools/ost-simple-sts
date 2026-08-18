@@ -1,9 +1,9 @@
-use std::{env, time::Duration};
-
-use reqwest::{
-    header::{HeaderMap, RETRY_AFTER},
-    StatusCode,
+use std::{
+    env,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use reqwest::{header::HeaderMap, StatusCode};
 use tokio::time::sleep;
 
 use crate::error::AppError;
@@ -13,7 +13,8 @@ const TRUSTED_GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_REQUEST_MAX_ATTEMPTS: usize = 2;
 const GITHUB_REQUEST_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-const GITHUB_REQUEST_MAX_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RATE_LIMIT_ERROR_BYTES: usize = 16 * 1024;
+const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Stores the configured base URL for GitHub API requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +110,7 @@ pub(super) async fn send_github_request(
         match builder.send().await {
             Ok(response) if is_retryable_response(response.status(), response.headers()) => {
                 if let Some(next_builder) = next_builder {
-                    let retry_delay = retry_delay(response.status(), response.headers(), backoff);
+                    let retry_delay = backoff;
                     tracing::warn!(
                         operation,
                         attempt,
@@ -160,42 +161,89 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn retry_delay(status: StatusCode, headers: &HeaderMap, fallback: Duration) -> Duration {
-    if is_retryable_response(status, headers) {
-        headers
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .map(|delay| delay.min(GITHUB_REQUEST_MAX_BACKOFF))
-            .unwrap_or(fallback)
-    } else {
-        fallback
-    }
-}
-
-fn is_retryable_response(status: StatusCode, headers: &HeaderMap) -> bool {
+fn is_retryable_response(status: StatusCode, _headers: &HeaderMap) -> bool {
     matches!(
         status,
-        StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
             | StatusCode::GATEWAY_TIMEOUT
-    ) || (status == StatusCode::FORBIDDEN && headers.contains_key(RETRY_AFTER))
+    )
+}
+
+pub(super) async fn github_rate_limit(mut response: reqwest::Response) -> Option<Duration> {
+    let status = response.status();
+    if !matches!(status.as_u16(), 403 | 422 | 429) {
+        return None;
+    }
+
+    let remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let reset_after = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|reset| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs();
+            Duration::from_secs(reset.saturating_sub(now))
+        });
+    let limited_message =
+        if matches!(status.as_u16(), 403 | 422) && remaining != Some(0) && retry_after.is_none() {
+            let mut body = Vec::new();
+            while body.len() < MAX_RATE_LIMIT_ERROR_BYTES {
+                let Ok(Some(chunk)) = response.chunk().await else {
+                    break;
+                };
+                let remaining = MAX_RATE_LIMIT_ERROR_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
+            body.contains("secondary rate limit")
+                || body.contains("abuse detection mechanism")
+                || (status == StatusCode::UNPROCESSABLE_ENTITY && body.contains("spammed"))
+        } else {
+            false
+        };
+
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || remaining == Some(0)
+        || retry_after.is_some()
+        || limited_message
+    {
+        let backoff =
+            retry_after.or_else(|| (remaining == Some(0)).then_some(reset_after).flatten());
+        return Some(
+            backoff
+                .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF)
+                .max(Duration::from_secs(1)),
+        );
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
-    use super::{github_api_url, retry_delay, send_github_request, GithubApiBase};
+    use super::{github_api_url, send_github_request, GithubApiBase};
 
     #[test]
     fn api_base_normalizes_path_prefixes() {
@@ -248,27 +296,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retry_delay_bounds_retry_after() {
-        let mut headers = HeaderMap::new();
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
-
-        assert_eq!(
-            retry_delay(
-                reqwest::StatusCode::TOO_MANY_REQUESTS,
-                &headers,
-                Duration::from_millis(200)
-            ),
-            Duration::from_secs(1)
-        );
-    }
-
     #[tokio::test]
     async fn retries_transient_statuses_before_success() {
         let server = MockServer::start().await;
         let client = reqwest::Client::new();
 
-        for status in [429, 500, 502, 503, 504] {
+        for status in [500, 502, 503, 504] {
             server.reset().await;
             Mock::given(method("GET"))
                 .and(path("/retry"))
@@ -296,46 +329,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_secondary_rate_limits_but_not_plain_forbidden() {
-        let server = MockServer::start().await;
-        let client = reqwest::Client::new();
-        Mock::given(method("GET"))
-            .and(path("/secondary-rate-limit"))
-            .respond_with(ResponseTemplate::new(403).insert_header("retry-after", "1"))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/secondary-rate-limit"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let response = send_github_request(
-            client.get(format!("{}/secondary-rate-limit", server.uri())),
-            "secondary rate limit test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-
-        server.reset().await;
-        Mock::given(method("GET"))
-            .and(path("/forbidden"))
-            .respond_with(ResponseTemplate::new(403))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let response = send_github_request(
-            client.get(format!("{}/forbidden", server.uri())),
-            "forbidden test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    async fn never_retries_rate_limits_inline() {
+        for status in [403, 422, 429] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "120"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let response = send_github_request(reqwest::Client::new().get(server.uri()), "test")
+                .await
+                .unwrap();
+            assert_eq!(
+                super::github_rate_limit(response).await,
+                Some(Duration::from_secs(120))
+            );
+        }
     }
 
     #[tokio::test]

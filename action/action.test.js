@@ -521,3 +521,19 @@ test("warns and makes no request for an unsafe GitHub API URL", async () => {
     "Unable to revoke the GitHub App installation token: GITHUB_API_URL must not contain credentials",
   ]);
 });
+
+test("retries a definite exchange rate limit with a fresh OIDC token", async () => {
+  const calls = [], waits = [];
+  const limited = response({ code: "github_rate_limited" }, 503);
+  limited.headers = { get: () => "75" };
+  const responses = [response({ value: "first" }), limited,
+    response({ value: "second" }), response({token: "installation", expires_at: expiresAt,
+      repository: "example/repository", ref: "refs/heads/main"})];
+  await runMain({env: environment(), appendFile: () => {}, write: () => {},
+    sleep: async (ms) => waits.push(ms), fetchImpl: async (url, options) => {
+      calls.push(options); return responses.shift();
+    }});
+  assert.deepEqual(waits, [75000]);
+  assert.equal(calls[1].headers.authorization, "Bearer first");
+  assert.equal(calls[3].headers.authorization, "Bearer second");
+});

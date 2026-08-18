@@ -75,7 +75,15 @@ async function request(fetchImpl, url, options, description) {
 async function requestJson(fetchImpl, url, options, description) {
   const response = await request(fetchImpl, url, options, description);
   if (!response.ok) {
-    throw new Error(`${description} request failed (${response.status})`);
+    const error = new Error(`${description} request failed (${response.status})`);
+    if (description === "token exchange" && response.status === 503) {
+      const retry = response.headers?.get("retry-after");
+      const body = await response.json().catch(() => null);
+      if (body?.code === "github_rate_limited" && /^[1-9][0-9]*$/u.test(retry || "")) {
+        error.retryAfter = Number(retry);
+      }
+    }
+    throw error;
   }
 
   try {
