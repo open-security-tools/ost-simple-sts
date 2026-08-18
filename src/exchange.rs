@@ -58,8 +58,6 @@ struct VerifiedClaims {
     multiple_target_repositories: bool,
     permissions: Permissions,
     git_ref: GitRef,
-    jti: Jti,
-    expires_at_ms: u64,
 }
 
 pub struct ExchangeResult {
@@ -71,25 +69,49 @@ pub struct ExchangeResult {
 }
 
 pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, AppError> {
-    let claims = verify_oidc_claims(&config, &request).await?;
-
+    let exchange_request = get_exchange_request(&request)?;
+    let claims = verify_signed_claims(&config, &request).await?;
+    let (jti, expires_at_ms) = replay_identity(&claims)?;
     replay::claim_jti(
         &config.dynamodb,
         &config.jti_table_name,
         ACTIONS_ISSUER,
-        &claims.jti,
-        claims.expires_at_ms,
+        &jti,
+        expires_at_ms,
     )
     .await?;
-
+    let claims = authorize_claims(&config, claims, exchange_request).await?;
     mint_installation_token(&config, &claims).await
 }
 
+#[cfg(test)]
 async fn verify_oidc_claims(
     config: &Config,
     request: &Request,
 ) -> Result<VerifiedClaims, AppError> {
     let exchange_request = get_exchange_request(request)?;
+    let claims = verify_signed_claims(config, request).await?;
+    authorize_claims(config, claims, exchange_request).await
+}
+
+fn replay_identity(claims: &GitHubActionsClaims) -> Result<(Jti, u64), AppError> {
+    let jti = claims
+        .jti
+        .clone()
+        .ok_or(AppError::OidcTokenMissingJti)
+        .and_then(Jti::try_from)?;
+    let exp = claims.exp.ok_or(AppError::OidcTokenMissingExp)?;
+    Ok((
+        jti,
+        exp.saturating_add(CLOCK_TOLERANCE_SECONDS)
+            .saturating_mul(1000),
+    ))
+}
+
+async fn verify_signed_claims(
+    config: &Config,
+    request: &Request,
+) -> Result<GitHubActionsClaims, AppError> {
     let oidc_token = get_bearer_token(request).ok_or(AppError::MissingBearerToken)?;
 
     let header = decode_header(oidc_token).map_err(map_jwt_error)?;
@@ -125,9 +147,24 @@ async fn verify_oidc_claims(
         return Err(AppError::InvalidOidcToken);
     }
 
+    replay_identity(&claims)?;
+    Ok(claims)
+}
+
+async fn authorize_claims(
+    config: &Config,
+    claims: GitHubActionsClaims,
+    exchange_request: Option<ExchangeRequest>,
+) -> Result<VerifiedClaims, AppError> {
     let loaded_policy = config
         .policy_cache
         .get_or_load(|| async {
+            replay::claim_policy_refresh(
+                &config.dynamodb,
+                &config.jti_table_name,
+                &config.policy_location,
+            )
+            .await?;
             let app_jwt = github::create_app_jwt(&config.app_id, &config.app_private_key)?;
             let policy = github::fetch_policy(
                 &config.http_client,
@@ -252,11 +289,6 @@ async fn verify_oidc_claims(
         None => authorized_repositories,
     };
 
-    let jti = claims
-        .jti
-        .ok_or(AppError::OidcTokenMissingJti)
-        .and_then(Jti::try_from)?;
-    let exp = claims.exp.ok_or(AppError::OidcTokenMissingExp)?;
     let (target_repository, target_repository_id) = target_repositories
         .first()
         .cloned()
@@ -275,8 +307,6 @@ async fn verify_oidc_claims(
             |request| request.permissions.clone(),
         ),
         git_ref: GitRef::try_from(git_ref).map_err(|_| AppError::RefNotAllowed)?,
-        jti,
-        expires_at_ms: exp.saturating_mul(1000) + CLOCK_TOLERANCE_SECONDS.saturating_mul(1000),
     })
 }
 
@@ -605,6 +635,11 @@ mod integration_tests {
                 .mount(&server)
                 .await;
 
+            Mock::given(method("POST"))
+                .and(wiremock::matchers::path_regex("^/dynamodb/?$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&server)
+                .await;
             Self {
                 server,
                 encoding_key,
@@ -723,6 +758,7 @@ mod integration_tests {
                     aws_sdk_dynamodb::Config::builder()
                         .behavior_version(aws_config::BehaviorVersion::latest())
                         .region(aws_config::Region::new("us-east-1"))
+                        .endpoint_url(format!("{}/dynamodb", self.server.uri()))
                         .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
                             "test", "test", None, None, "test",
                         ))
@@ -732,6 +768,72 @@ mod integration_tests {
                 jwks_cache,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn replay_is_rejected_before_any_github_api_request() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.policy_cache = Arc::new(crate::policy_cache::PolicyCache::default());
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("^/dynamodb/?$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+                "message": "already claimed"
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        let token = fixture.sign_claims(fixture.valid_claims());
+        assert!(matches!(
+            handle(config, fixture.make_request(&token)).await,
+            Err(AppError::OidcTokenReplayed)
+        ));
+        assert!(fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| matches!(
+                r.url.path(),
+                "/.well-known/jwks" | "/dynamodb" | "/dynamodb/"
+            )));
+    }
+
+    #[tokio::test]
+    async fn shared_refresh_admission_precedes_github_requests() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.policy_cache = Arc::new(crate::policy_cache::PolicyCache::default());
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex("^/dynamodb/?$"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "ConditionExpression": "attribute_not_exists(jti_hash) OR #ttl <= :now"
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException"
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        let token = fixture.sign_claims(fixture.valid_claims());
+        assert!(matches!(
+            handle(config, fixture.make_request(&token)).await,
+            Err(AppError::GithubRateLimited { .. })
+        ));
+        assert!(fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| matches!(
+                r.url.path(),
+                "/.well-known/jwks" | "/dynamodb" | "/dynamodb/"
+            )));
     }
 
     #[tokio::test]
@@ -1837,8 +1939,6 @@ mod integration_tests {
             multiple_target_repositories: false,
             permissions: Permissions::contents_write(),
             git_ref: "refs/heads/main".try_into().unwrap(),
-            jti: "test-jti".try_into().unwrap(),
-            expires_at_ms: 0,
         };
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
@@ -2137,8 +2237,6 @@ mod integration_tests {
             )
             .unwrap(),
             git_ref: "refs/heads/main".try_into().unwrap(),
-            jti: "test-jti".try_into().unwrap(),
-            expires_at_ms: 0,
         };
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
@@ -2188,8 +2286,6 @@ mod integration_tests {
             multiple_target_repositories: false,
             permissions: Permissions::contents_write(),
             git_ref: "refs/heads/main".try_into().unwrap(),
-            jti: "test-jti".try_into().unwrap(),
-            expires_at_ms: 0,
         };
 
         let result = mint_installation_token(&config, &claims).await.unwrap();
@@ -2235,8 +2331,6 @@ mod integration_tests {
             multiple_target_repositories: true,
             permissions: Permissions::contents_write(),
             git_ref: "refs/heads/main".try_into().unwrap(),
-            jti: "test-jti".try_into().unwrap(),
-            expires_at_ms: 0,
         };
 
         assert!(matches!(
