@@ -53,6 +53,9 @@ function parsePermissions(input) {
     if (!repositoryPermissions.has(name)) {
       throw new Error(`unknown repository permission: ${name}`);
     }
+    if (name === "administration" && level !== "read") {
+      throw new Error("administration is limited to read access");
+    }
     if ((name === "workflows" && level !== "write") || (name !== "repository_projects" && level === "admin")) {
       throw new Error(`invalid level for repository permission: ${name}`);
     }

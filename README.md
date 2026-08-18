@@ -63,6 +63,8 @@ Install the App on the repository that owns the policy and each target repositor
 policy; it does not need to be installed on a separate calling repository. The policy reader
 requests only `contents: read` for the pinned policy repository. Exchanges request only the
 permissions selected by the caller and allowed by the matched policy rule.
+`administration: write` is not supported because some GitHub endpoints apply it beyond
+the selected existing repositories; `administration: read` remains available.
 
 ## Policy
 
