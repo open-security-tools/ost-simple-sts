@@ -451,7 +451,10 @@ impl Policy {
             Some(1) => {
                 let raw: RawHostedPolicy =
                     serde_json::from_value(strict).map_err(|_| AppError::InvalidPolicy)?;
-                if raw.version != 1 || raw.rules.len() > MAX_HOSTED_POLICY_RULES {
+                if raw.version != 1
+                    || raw.rules.len() > MAX_HOSTED_POLICY_RULES
+                    || raw.rules.iter().any(|rule| rule.permissions.is_none())
+                {
                     return Err(AppError::InvalidPolicy);
                 }
                 Self::try_from(RawPolicy {
@@ -1034,6 +1037,23 @@ mod tests {
         WorkflowPath,
     };
     use serde_json::json;
+
+    #[test]
+    fn hosted_v1_requires_an_explicit_permission_ceiling() {
+        let audience = Audience::try_from("https://example.com").unwrap();
+        let mut document = json!({"version": 1, "rules": [{
+            "subject": "repo:octo/tools:ref:refs/heads/main",
+            "repository": "octo/tools", "repository_id": 42,
+            "ref": "refs/heads/main", "workflow_path": ".github/workflows/release.yml"
+        }]});
+        assert!(Policy::from_hosted(&document.to_string(), &audience).is_err());
+        document["rules"][0]["permissions"] = json!({"contents": "read"});
+        let policy = Policy::from_hosted(&document.to_string(), &audience).unwrap();
+        assert_eq!(
+            serde_json::to_value(policy.rules()[0].permissions()).unwrap(),
+            json!({"contents": "read"})
+        );
+    }
 
     #[test]
     fn policy_deserializes_into_validated_types() {

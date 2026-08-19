@@ -141,7 +141,9 @@ Keep the environment's deployment rules restricted to the intended branch.
 
 The broker continues to accept `version: 1` policies during migration. Those policies retain the
 explicit `subject`, repository name/ID pairs, workflow paths, `allowed_events`, and target fields;
-the compatibility defaults for events and permissions are unchanged.
+the event default is unchanged, but every version 1 rule must now include a non-empty
+`permissions` map. Before updating the broker, add the intended permission ceiling to each
+version 1 rule, or migrate it to version 2. Omitted permissions fail policy validation.
 
 The policy is fetched from the configured repository name and immutable ID, the protected `main`
 ref, and the configured path under `.github`. Protect the default branch with a pull-request
