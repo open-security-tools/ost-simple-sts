@@ -70,10 +70,10 @@ impl<'de> Deserialize<'de> for Permissions {
 
 fn is_valid_repository_permission(name: &str, level: PermissionLevel) -> bool {
     match name {
+        "administration" => level == PermissionLevel::Read,
         "repository_projects" => true,
         "workflows" => level == PermissionLevel::Write,
         "actions"
-        | "administration"
         | "artifact_metadata"
         | "attestations"
         | "checks"
@@ -104,6 +104,14 @@ fn is_valid_repository_permission(name: &str, level: PermissionLevel) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn administration_write_is_not_repository_scoped() {
+        assert!(
+            serde_json::from_str::<super::Permissions>(r#"{"administration":"write"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<super::Permissions>(r#"{"administration":"read"}"#).is_ok());
+    }
+
     use serde_json::json;
 
     use super::Permissions;

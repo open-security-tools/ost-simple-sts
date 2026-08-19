@@ -521,3 +521,8 @@ test("warns and makes no request for an unsafe GitHub API URL", async () => {
     "Unable to revoke the GitHub App installation token: GITHUB_API_URL must not contain credentials",
   ]);
 });
+
+test("rejects administration write before requesting credentials", async () => {
+  await assert.rejects(runMain({ env: environment({ INPUT_PERMISSIONS: "administration: write" }),
+    fetchImpl: assert.fail }), /administration is limited to read/);
+});
