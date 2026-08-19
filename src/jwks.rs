@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::{jwk::JwkSet, DecodingKey};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::error::AppError;
 
@@ -13,6 +13,7 @@ pub struct JwksCache {
     http_client: reqwest::Client,
     jwks_url: String,
     inner: RwLock<JwksState>,
+    refresh_lock: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -32,6 +33,7 @@ impl JwksCache {
             http_client,
             jwks_url: ACTIONS_JWKS_URL.to_string(),
             inner: RwLock::new(JwksState::default()),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -41,6 +43,7 @@ impl JwksCache {
             http_client,
             jwks_url,
             inner: RwLock::new(JwksState::default()),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -62,6 +65,7 @@ impl JwksCache {
             }
         }
 
+        let _refresh = self.refresh_lock.lock().await;
         let mut guard = self.inner.write().await;
         if let Some(cached) = guard.cached.as_ref() {
             if cached.fetched_at.elapsed() < JWKS_TTL {
@@ -84,9 +88,11 @@ impl JwksCache {
             return Err(AppError::OidcVerificationUnavailable);
         }
         guard.last_refresh_attempt = Some(Instant::now());
+        drop(guard);
 
         let jwk_set = self.refresh().await?;
         let key = Self::find_key(&jwk_set, kid).ok_or(AppError::InvalidOidcToken);
+        let mut guard = self.inner.write().await;
         guard.cached = Some(CachedJwks {
             fetched_at: Instant::now(),
             jwk_set,
@@ -266,6 +272,43 @@ mod tests {
         }
 
         cache.decoding_key_for("rotated-kid").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_key_does_not_wait_for_unknown_key_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(jwks_body("known-kid")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache = JwksCache::new_with_url(test_http_client(), server.uri());
+        {
+            let mut state = cache.inner.write().await;
+            state.cached = Some(CachedJwks {
+                fetched_at: Instant::now(),
+                jwk_set: serde_json::from_value(jwks_body("known-kid")).unwrap(),
+            });
+        }
+        let refresh = cache.decoding_key_for("missing-kid");
+        let known = async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                cache.decoding_key_for("known-kid"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(refresh, known);
+        assert!(matches!(result, Err(AppError::InvalidOidcToken)));
     }
 
     #[tokio::test]
