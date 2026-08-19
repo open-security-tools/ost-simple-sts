@@ -106,8 +106,10 @@ The exchange succeeds only when all of these checks pass:
 repository alias pins its name and immutable ID and declares the OIDC subject format. Use
 `oidc_subject: "legacy"` for `repo:OWNER/REPO` subjects and `oidc_subject: "immutable"` with an
 `owner_id` for `repo:OWNER@OWNER_ID/REPO@REPOSITORY_ID` subjects. The broker derives the exact
-subject from the caller repository, its configured format, and `environment` (or `caller_ref` when
-no environment is set), so callers cannot accidentally mix the two formats.
+subject from the caller repository, its configured format, and `environment`. Without an
+environment, pull-request rules use the `pull_request` subject context and other events use
+`caller_ref`. Colons in context values are encoded as `%3A`. Split PR and non-PR events into
+separate rules when no environment is configured.
 
 Each rule names a `caller`, a `caller_workflow` filename under `.github/workflows`, a non-empty `on`
 event list, and an explicit `permissions` ceiling. `caller_ref` defaults to `refs/heads/main`; set
