@@ -71,7 +71,18 @@ impl AppError {
             error: self.to_string(),
         };
 
-        json_response(status, &body)
+        let mut response = json_response(status, &body);
+        if let AppError::GithubRateLimited { retry_after } = self {
+            let seconds = retry_after
+                .as_secs()
+                .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+                .max(1);
+            response.headers_mut().insert(
+                "retry-after",
+                seconds.to_string().parse().expect("valid retry delay"),
+            );
+        }
+        response
     }
 }
 
@@ -112,6 +123,16 @@ mod tests {
 
     use super::AppResponse;
     use crate::github::Token;
+
+    #[test]
+    fn rate_limit_response_preserves_retry_timing() {
+        let response = crate::error::AppError::GithubRateLimited {
+            retry_after: std::time::Duration::from_millis(1501),
+        }
+        .into_response();
+        assert_eq!(response.status().as_u16(), 503);
+        assert_eq!(response.headers()["retry-after"], "2");
+    }
 
     #[test]
     fn exchange_response_redacts_debug_and_serializes_token() {

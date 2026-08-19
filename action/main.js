@@ -95,6 +95,7 @@ async function run({
   appendFile = appendFileSync,
   write = process.stdout.write.bind(process.stdout),
   uuid,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   const exchangeUrl = env["INPUT_EXCHANGE-URL"];
   const audience = env.INPUT_AUDIENCE;
@@ -127,6 +128,9 @@ async function run({
   const oidcUrl = parseHttpsUrl(oidcRequestUrl, "ACTIONS_ID_TOKEN_REQUEST_URL", true);
   oidcUrl.searchParams.set("audience", audience);
 
+  let exchangeResponse;
+  for (let attempt = 0; ; attempt++) {
+    try {
   const oidcResponse = await requestJson(
     fetchImpl,
     oidcUrl.toString(),
@@ -136,7 +140,7 @@ async function run({
   const oidcToken = requiredString(oidcResponse.value, "OIDC token");
   addMask(oidcToken, write);
 
-  const exchangeResponse = await requestJson(
+  exchangeResponse = await requestJson(
     fetchImpl,
     exchangeUrl,
     {
@@ -153,6 +157,12 @@ async function run({
     },
     "token exchange",
   );
+      break;
+    } catch (error) {
+      if (attempt >= 2 || !Number.isSafeInteger(error.retryAfter) || error.retryAfter > 3600) throw error;
+      await sleep(error.retryAfter * 1000);
+    }
+  }
   const token = requiredString(exchangeResponse.token, "installation token");
   addMask(token, write);
   appendFileCommand(env.GITHUB_STATE, "token", token, appendFile, uuid);

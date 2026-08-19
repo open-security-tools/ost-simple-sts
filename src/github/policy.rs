@@ -1,23 +1,17 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::collections::BTreeMap;
 
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    api::{github_api_url, github_request, GithubApiBase},
+    api::{github_api_url, github_rate_limit, github_request, GithubApiBase},
     RepositoryId, Token,
 };
 use crate::{config::PolicyLocation, error::AppError};
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const MAX_POLICY_BYTES: usize = 256 * 1024;
-const MAX_RATE_LIMIT_ERROR_BYTES: usize = 16 * 1024;
-const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
-const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Deserialize)]
 struct PolicyTokenResponse {
@@ -40,7 +34,9 @@ pub async fn fetch_policy(
 ) -> Result<String, AppError> {
     let token = mint_policy_token(client, base, app_jwt, location).await?;
     let result = fetch_policy_with_token(client, base, &token, location).await;
-    revoke_policy_token(client, base, &token).await;
+    if let Some(retry_after) = revoke_policy_token(client, base, &token).await {
+        return Err(AppError::GithubRateLimited { retry_after });
+    }
     result
 }
 
@@ -184,9 +180,13 @@ async fn fetch_policy_with_token(
     String::from_utf8(bytes).map_err(|_| AppError::PolicyLookupFailed)
 }
 
-async fn revoke_policy_token(client: &reqwest::Client, base: &GithubApiBase, token: &Token) {
+async fn revoke_policy_token(
+    client: &reqwest::Client,
+    base: &GithubApiBase,
+    token: &Token,
+) -> Option<std::time::Duration> {
     let Ok(url) = github_api_url(base, "installation/token") else {
-        return;
+        return None;
     };
     match github_request(client.delete(url), token.as_str())
         .send()
@@ -194,71 +194,10 @@ async fn revoke_policy_token(client: &reqwest::Client, base: &GithubApiBase, tok
     {
         Ok(response) if response.status() == StatusCode::NO_CONTENT => {}
         Ok(response) => {
-            tracing::warn!(status = %response.status(), "failed to revoke policy token")
+            tracing::warn!(status = %response.status(), "failed to revoke policy token");
+            return github_rate_limit(response).await;
         }
         Err(error) => tracing::warn!(?error, "failed to revoke policy token"),
-    }
-}
-
-async fn github_rate_limit(mut response: reqwest::Response) -> Option<Duration> {
-    let status = response.status();
-    if !matches!(status.as_u16(), 403 | 422 | 429) {
-        return None;
-    }
-
-    let remaining = response
-        .headers()
-        .get("x-ratelimit-remaining")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs);
-    let reset_after = response
-        .headers()
-        .get("x-ratelimit-reset")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|reset| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_secs();
-            Duration::from_secs(reset.saturating_sub(now))
-        });
-    let limited_message =
-        if matches!(status.as_u16(), 403 | 422) && remaining != Some(0) && retry_after.is_none() {
-            let mut body = Vec::new();
-            while body.len() < MAX_RATE_LIMIT_ERROR_BYTES {
-                let Ok(Some(chunk)) = response.chunk().await else {
-                    break;
-                };
-                let remaining = MAX_RATE_LIMIT_ERROR_BYTES - body.len();
-                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            }
-            let body = String::from_utf8_lossy(&body).to_ascii_lowercase();
-            body.contains("secondary rate limit")
-                || body.contains("abuse detection mechanism")
-                || (status == StatusCode::UNPROCESSABLE_ENTITY && body.contains("spammed"))
-        } else {
-            false
-        };
-
-    if status == StatusCode::TOO_MANY_REQUESTS
-        || remaining == Some(0)
-        || retry_after.is_some()
-        || limited_message
-    {
-        let backoff =
-            retry_after.or_else(|| (remaining == Some(0)).then_some(reset_after).flatten());
-        return Some(
-            backoff
-                .unwrap_or(DEFAULT_RATE_LIMIT_BACKOFF)
-                .clamp(Duration::from_secs(1), MAX_RATE_LIMIT_BACKOFF),
-        );
     }
     None
 }

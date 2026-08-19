@@ -165,8 +165,8 @@ impl AppError {
             | Self::GithubAccessTokenRequestForbidden => StatusCode::FAILED_DEPENDENCY,
             Self::GithubInstallationLookupFailed
             | Self::GithubAccessTokenRequestFailed
-            | Self::PolicyLookupFailed
-            | Self::GithubRateLimited { .. } => StatusCode::BAD_GATEWAY,
+            | Self::PolicyLookupFailed => StatusCode::BAD_GATEWAY,
+            Self::GithubRateLimited { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::InstallationTokenRequestInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidExchangeRequest => StatusCode::BAD_REQUEST,
         }

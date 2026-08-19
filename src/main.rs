@@ -53,6 +53,7 @@ macro_rules! impl_string_newtype {
 
 pub(crate) use impl_string_newtype;
 
+mod backoff;
 mod config;
 mod error;
 mod exchange;

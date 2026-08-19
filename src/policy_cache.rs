@@ -69,10 +69,11 @@ impl PolicyCache {
         let multiplier = 1u32
             .checked_shl(state.consecutive_rate_limits.saturating_sub(1))
             .unwrap_or(u32::MAX);
-        let retry_after = retry_after
-            .clamp(Duration::from_secs(1), MAX_BACKOFF)
+        let requested_delay = retry_after.max(Duration::from_secs(1));
+        let retry_after = requested_delay
             .saturating_mul(multiplier)
             .min(MAX_BACKOFF)
+            .max(requested_delay)
             .saturating_add(self.jitter);
         state.retry_at = Some(Instant::now() + retry_after);
         retry_after

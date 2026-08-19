@@ -71,7 +71,18 @@ pub struct ExchangeResult {
 }
 
 pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, AppError> {
-    let claims = verify_oidc_claims(&config, &request).await?;
+    let result = handle_inner(&config, &request).await;
+    if let Err(AppError::GithubRateLimited { retry_after }) = &result {
+        crate::backoff::record(&config, *retry_after).await?;
+    }
+    result
+}
+
+async fn handle_inner(config: &Config, request: &Request) -> Result<ExchangeResult, AppError> {
+    let exchange_request = get_exchange_request(request)?;
+    let signed = verify_signed_claims(config, request).await?;
+    crate::backoff::check(config).await?;
+    let claims = authorize_claims(config, signed, exchange_request).await?;
 
     replay::claim_jti(
         &config.dynamodb,
@@ -82,14 +93,23 @@ pub async fn handle(config: Config, request: Request) -> Result<ExchangeResult, 
     )
     .await?;
 
-    mint_installation_token(&config, &claims).await
+    mint_installation_token(config, &claims).await
 }
 
+#[cfg(test)]
 async fn verify_oidc_claims(
     config: &Config,
     request: &Request,
 ) -> Result<VerifiedClaims, AppError> {
     let exchange_request = get_exchange_request(request)?;
+    let signed = verify_signed_claims(config, request).await?;
+    authorize_claims(config, signed, exchange_request).await
+}
+
+async fn verify_signed_claims(
+    config: &Config,
+    request: &Request,
+) -> Result<GitHubActionsClaims, AppError> {
     let oidc_token = get_bearer_token(request).ok_or(AppError::MissingBearerToken)?;
 
     let header = decode_header(oidc_token).map_err(map_jwt_error)?;
@@ -125,6 +145,14 @@ async fn verify_oidc_claims(
         return Err(AppError::InvalidOidcToken);
     }
 
+    Ok(claims)
+}
+
+async fn authorize_claims(
+    config: &Config,
+    claims: GitHubActionsClaims,
+    exchange_request: Option<ExchangeRequest>,
+) -> Result<VerifiedClaims, AppError> {
     let loaded_policy = config
         .policy_cache
         .get_or_load(|| async {
@@ -732,6 +760,57 @@ mod integration_tests {
                 jwks_cache,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shared_backoff_stops_another_worker_before_github() {
+        let fixture = TestFixture::new().await;
+        let mut config = fixture.build_config(fixture.policy());
+        config.policy_cache = Arc::new(crate::policy_cache::PolicyCache::default());
+        config.dynamodb = aws_sdk_dynamodb::Client::from_conf(
+            aws_sdk_dynamodb::Config::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new("us-east-1"))
+                .endpoint_url(fixture.server.uri())
+                .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                    "test", "test", None, None, "test",
+                ))
+                .build(),
+        );
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::header(
+                "x-amz-target",
+                "DynamoDB_20120810.GetItem",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Item": {"ttl": {"N": (fixture.now_secs() + 120).to_string()}}
+            })))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::header(
+                "x-amz-target",
+                "DynamoDB_20120810.PutItem",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&fixture.server)
+            .await;
+        let token = fixture.sign_claims(fixture.valid_claims());
+        assert!(matches!(
+            handle(config, fixture.make_request(&token)).await,
+            Err(AppError::GithubRateLimited { .. })
+        ));
+        assert!(!fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().starts_with("/app/") || r.url.path().starts_with("/repos/")));
     }
 
     #[tokio::test]

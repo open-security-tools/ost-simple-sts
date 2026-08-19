@@ -7,7 +7,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::api::{github_api_url, github_request, send_github_request, GithubApiBase};
+use super::api::{
+    github_api_url, github_rate_limit, github_request, send_github_request, GithubApiBase,
+};
 use super::{Permissions, RepositoryFullName, RepositoryId};
 use crate::error::AppError;
 
@@ -124,6 +126,15 @@ pub async fn find_installation(
         AppError::GithubInstallationLookupFailed
     })?;
 
+    let status = response.status().as_u16();
+    if matches!(status, 403 | 422 | 429) {
+        let retry_after = github_rate_limit(response).await;
+        return Err(retry_after
+            .map_or(AppError::GithubInstallationLookupForbidden, |retry_after| {
+                AppError::GithubRateLimited { retry_after }
+            }));
+    }
+
     match response.status().as_u16() {
         200 => response
             .json::<RepositoryInstallation>()
@@ -168,6 +179,21 @@ pub async fn mint_installation_token(
             tracing::error!(?error, "installation token request failed");
             AppError::GithubAccessTokenRequestFailed
         })?;
+
+    let status = response.status().as_u16();
+    if matches!(status, 403 | 422 | 429) {
+        let retry_after = github_rate_limit(response).await;
+        let fallback = if status == 422 {
+            AppError::InstallationTokenRequestInvalid
+        } else {
+            AppError::GithubAccessTokenRequestForbidden
+        };
+        return Err(
+            retry_after.map_or(fallback, |retry_after| AppError::GithubRateLimited {
+                retry_after,
+            }),
+        );
+    }
 
     match response.status().as_u16() {
         201 => {
