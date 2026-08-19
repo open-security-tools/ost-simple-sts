@@ -118,12 +118,11 @@ for Lambda errors and throttles, API 5xx responses, GitHub App dependency failur
 receive notifications. Access logs deliberately omit request headers, OIDC claims, and response
 bodies.
 
-`make deploy-secrets` stores the App ID and private key in AWS. `make deploy` configures the policy
-repository, path, and protected ref, then deploys the SAM stack. The OIDC audience defaults to the
-deployed API URL. Set `POLICY_REPOSITORY`, `POLICY_REPOSITORY_ID`, `POLICY_INSTALLATION_ID`,
-`POLICY_PATH`, `POLICY_REF`, `STACK_NAME`, `APP_ID_PARAMETER`, and `JTI_TABLE_NAME` in `.env`.
-Set `POLICY_AUDIENCE` only when using a custom HTTPS endpoint; `ALARM_TOPIC_ARN` is optional as
-well. Protect the policy repository's default branch with a pull-request ruleset that issued tokens
+Provision the App ID in SSM Parameter Store and the private key in Secrets Manager using the
+deployment environment's normal secret-management process. Follow the explicit SAM deployment
+command in the [README](./README.md#deploy), including `--confirm-changeset` for manual deployments.
+Pass only the secret's name to the stack. The OIDC audience defaults to the deployed API URL.
+Protect the policy repository's default branch with a pull-request ruleset that issued tokens
 cannot bypass.
 
 ## Validated domain types
