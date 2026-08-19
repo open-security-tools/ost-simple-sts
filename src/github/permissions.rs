@@ -22,6 +22,28 @@ impl Permissions {
         )]))
     }
 
+    pub fn matches_response(&self, granted: &BTreeMap<String, String>) -> bool {
+        let expected = self
+            .0
+            .iter()
+            .map(|(name, level)| {
+                let value = match level {
+                    PermissionLevel::Read => "read",
+                    PermissionLevel::Write => "write",
+                    PermissionLevel::Admin => "admin",
+                };
+                (name.clone(), value.to_string())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut granted = granted.clone();
+        if !expected.contains_key("metadata")
+            && granted.get("metadata").is_some_and(|v| v == "read")
+        {
+            granted.remove("metadata");
+        }
+        granted == expected
+    }
+
     pub fn permits(&self, requested: &Self) -> bool {
         requested
             .0

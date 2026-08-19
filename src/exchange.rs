@@ -1820,6 +1820,7 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_target_only",
                 "expires_at": "2026-07-16T14:00:00Z",
+                "permissions": {"contents": "write"},
                 "repositories": [{ "id": 84, "full_name": "octo/tools-dev" }]
             })))
             .expect(1)
@@ -2108,6 +2109,7 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_multi_target",
                 "expires_at": "2026-07-16T14:00:00Z",
+                "permissions": {"contents": "write", "pull_requests": "write"},
                 "repositories": [
                     { "id": 1302176231, "full_name": "astral-sh/uv-dev" },
                     { "id": 699532645, "full_name": "astral-sh/uv" }
@@ -2171,6 +2173,7 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_subset_target",
                 "expires_at": "2026-07-16T14:00:00Z",
+                "permissions": {"contents": "write"},
                 "repositories": [{ "id": 699532645, "full_name": "astral-sh/uv" }]
             })))
             .expect(1)

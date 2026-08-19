@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +22,8 @@ pub struct InstallationToken {
     pub token: Token,
     pub expires_at: String,
     repositories: Vec<GrantedRepository>,
+    #[serde(default)]
+    permissions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +181,8 @@ pub async fn mint_installation_token(
                     tracing::error!(?error, "failed to decode installation token response");
                     AppError::GithubAccessTokenRequestFailed
                 })?;
-            if token.repositories.len() != repositories.len()
+            if !permissions.matches_response(&token.permissions)
+                || token.repositories.len() != repositories.len()
                 || !repositories.iter().all(|(repository, repository_id)| {
                     token.repositories.iter().any(|granted| {
                         granted.id == **repository_id && granted.full_name == repository.as_str()
@@ -314,6 +318,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_test123",
                 "expires_at": "2026-03-28T00:00:00Z",
+                "permissions": {"contents": "write", "pull_requests": "read"},
                 "repositories": [{ "id": 42, "full_name": "octo/tools" }]
             })))
             .expect(1)
@@ -336,6 +341,42 @@ mod tests {
         .unwrap();
         assert_eq!(token.token.as_str(), "ghs_test123");
         assert_eq!(token.expires_at, "2026-03-28T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn validates_returned_permissions() {
+        let server = MockServer::start().await;
+        for (granted, accepted) in [
+            (json!({"contents":"read"}), true),
+            (json!({"contents":"read", "metadata":"read"}), true),
+            (json!({}), false),
+            (json!({"contents":"write"}), false),
+            (json!({"contents":"read", "issues":"write"}), false),
+            (json!({"contents":"read", "metadata":"write"}), false),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "token":"test", "expires_at":"2026-08-18T00:00:00Z",
+                    "repositories":[{"id":42,"full_name":"octo/tools"}], "permissions":granted
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = mint_installation_token(
+                &reqwest::Client::new(),
+                &GithubApiBase::for_test(&server.uri()),
+                "app",
+                123,
+                &[(
+                    RepositoryFullName::try_from("octo/tools").unwrap(),
+                    serde_json::from_value(json!(42)).unwrap(),
+                )],
+                &serde_json::from_value(json!({"contents":"read"})).unwrap(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), accepted, "{granted}");
+        }
     }
 
     #[tokio::test]
@@ -419,6 +460,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                     "token": "ghs_test123",
                     "expires_at": "2026-03-28T00:00:00Z",
+                "permissions": {"contents": "write"},
                     "repositories": repositories
                 })))
                 .mount(&server)
@@ -461,6 +503,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "token": "ghs_multi",
                 "expires_at": "2026-03-28T00:00:00Z",
+                "permissions": {"contents": "write", "pull_requests": "write"},
                 "repositories": [
                     { "id": 1302176231, "full_name": "astral-sh/uv-dev" },
                     { "id": 699532645, "full_name": "astral-sh/uv" }
@@ -524,6 +567,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                     "token": "ghs_multi",
                     "expires_at": "2026-03-28T00:00:00Z",
+                "permissions": {"contents": "write"},
                     "repositories": repositories
                 })))
                 .mount(&server)
