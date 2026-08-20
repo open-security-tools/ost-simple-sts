@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::{
     api::{github_api_url, github_request, GithubApiBase},
-    RepositoryId, Token,
+    find_installation, RepositoryFullName, RepositoryId, Token,
 };
 use crate::{config::PolicyLocation, error::AppError};
 
@@ -32,34 +32,52 @@ struct GrantedRepository {
     full_name: String,
 }
 
+pub struct FetchedPolicy {
+    pub contents: String,
+    pub repository_id: RepositoryId,
+    pub installation_id: u64,
+}
+
 pub async fn fetch_policy(
     client: &reqwest::Client,
     base: &GithubApiBase,
     app_jwt: &str,
+    repository: &RepositoryFullName,
     location: &PolicyLocation,
-) -> Result<String, AppError> {
-    let token = mint_policy_token(client, base, app_jwt, location).await?;
-    let result = fetch_policy_with_token(client, base, &token, location).await;
+) -> Result<FetchedPolicy, AppError> {
+    let installation_id = find_installation(
+        client,
+        base,
+        app_jwt,
+        repository.owner().as_str(),
+        repository.repo().as_str(),
+    )
+    .await?;
+    let (token, repository_id) =
+        mint_policy_token(client, base, app_jwt, repository, installation_id).await?;
+    let result = fetch_policy_with_token(client, base, &token, repository, location).await;
     revoke_policy_token(client, base, &token).await;
-    result
+    Ok(FetchedPolicy {
+        contents: result?,
+        repository_id,
+        installation_id,
+    })
 }
 
 async fn mint_policy_token(
     client: &reqwest::Client,
     base: &GithubApiBase,
     app_jwt: &str,
-    location: &PolicyLocation,
-) -> Result<Token, AppError> {
+    repository: &RepositoryFullName,
+    installation_id: u64,
+) -> Result<(Token, RepositoryId), AppError> {
     let url = github_api_url(
         base,
-        &format!(
-            "app/installations/{}/access_tokens",
-            location.installation_id()
-        ),
+        &format!("app/installations/{installation_id}/access_tokens"),
     )?;
     let response = github_request(client.post(url), app_jwt)
         .json(&json!({
-            "repository_ids": [*location.repository_id()],
+            "repositories": [repository.repo().as_str()],
             "permissions": {"contents": "read"}
         }))
         .send()
@@ -97,15 +115,14 @@ async fn mint_policy_token(
                 ("metadata".to_string(), "read".to_string()),
             ]);
             if response.repositories.len() != 1
-                || response.repositories[0].id != location.repository_id()
-                || response.repositories[0].full_name != location.repository().as_str()
+                || response.repositories[0].full_name != repository.as_str()
                 || response.permissions != expected_permissions
             {
                 tracing::error!("github returned an unexpectedly scoped policy token");
                 revoke_policy_token(client, base, &response.token).await;
                 return Err(AppError::InstallationTokenRequestInvalid);
             }
-            Ok(response.token)
+            Ok((response.token, response.repositories[0].id))
         }
         401 => Err(AppError::GithubAppAuthInvalid),
         status @ (403 | 422 | 429) => {
@@ -131,15 +148,12 @@ async fn fetch_policy_with_token(
     client: &reqwest::Client,
     base: &GithubApiBase,
     token: &Token,
+    repository: &RepositoryFullName,
     location: &PolicyLocation,
 ) -> Result<String, AppError> {
     let mut url = github_api_url(
         base,
-        &format!(
-            "repos/{}/contents/{}",
-            location.repository().as_str(),
-            location.path()
-        ),
+        &format!("repos/{}/contents/{}", repository.as_str(), location.path()),
     )?;
     url.query_pairs_mut()
         .append_pair("ref", location.git_ref().as_str());
@@ -276,13 +290,19 @@ mod tests {
     use super::{fetch_policy, MAX_POLICY_BYTES};
 
     async fn mount_token(server: &MockServer, response: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/tools/installation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 456})))
+            .expect(1)
+            .mount(server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/app/installations/456/access_tokens"))
             .and(header("authorization", "Bearer app-jwt"))
             .and(header("accept", "application/vnd.github+json"))
             .and(header("x-github-api-version", "2022-11-28"))
             .and(body_json(json!({
-                "repository_ids": [42],
+                "repositories": ["tools"],
                 "permissions": {"contents": "read"}
             })))
             .respond_with(ResponseTemplate::new(201).set_body_json(response))
@@ -327,12 +347,15 @@ mod tests {
             &reqwest::Client::new(),
             &GithubApiBase::for_test(server.uri().as_str()),
             "app-jwt",
+            &"octo/tools".try_into().unwrap(),
             &PolicyLocation::for_test(),
         )
         .await
         .unwrap();
 
-        assert_eq!(policy, r#"{"version":1,"rules":[]}"#);
+        assert_eq!(policy.contents, r#"{"version":1,"rules":[]}"#);
+        assert_eq!(*policy.repository_id, 42);
+        assert_eq!(policy.installation_id, 456);
     }
 
     #[tokio::test]
@@ -340,7 +363,7 @@ mod tests {
         for response in [
             json!({
                 "token": "policy-token",
-                "repositories": [{"id": 43, "full_name": "octo/tools"}],
+                "repositories": [{"id": 0, "full_name": "octo/tools"}],
                 "permissions": {"contents": "read", "metadata": "read"}
             }),
             json!({
@@ -362,6 +385,7 @@ mod tests {
                     &reqwest::Client::new(),
                     &GithubApiBase::for_test(server.uri().as_str()),
                     "app-jwt",
+                    &"octo/tools".try_into().unwrap(),
                     &PolicyLocation::for_test(),
                 )
                 .await,
@@ -393,6 +417,7 @@ mod tests {
                     &reqwest::Client::new(),
                     &GithubApiBase::for_test(server.uri().as_str()),
                     "app-jwt",
+                    &"octo/tools".try_into().unwrap(),
                     &PolicyLocation::for_test(),
                 )
                 .await,
@@ -419,6 +444,7 @@ mod tests {
                 &reqwest::Client::new(),
                 &GithubApiBase::for_test(server.uri().as_str()),
                 "app-jwt",
+                &"octo/tools".try_into().unwrap(),
                 &PolicyLocation::for_test(),
             )
             .await,

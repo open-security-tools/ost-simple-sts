@@ -17,6 +17,7 @@ HTTP / Lambda
 
 src/config.rs                  validated policy and runtime configuration
 src/policy_cache.rs            last-known-good policy cache and refresh backoff
+src/policy_store.rs            bounded, per-target policy caches
 src/error.rs                   stable error codes and HTTP status mapping
 src/response.rs                no-store JSON responses and token redaction
 ```
@@ -25,8 +26,9 @@ src/response.rs                no-store JSON responses and token redaction
 
 1. `/exchange` receives a GitHub Actions OIDC JWT.
 1. The JWT is validated against the Actions JWKS and configured audience.
-1. A read-only App token fetches the protected repository policy when the cache expires.
-1. The complete policy is validated before it replaces the cached snapshot.
+1. For each target, a read-only App token fetches its protected policy when that cache expires.
+1. Each complete policy is validated before replacing its cached snapshot.
+1. Every target independently approves its own name, immutable ID, caller, and permissions.
 1. The `jti` is claimed in DynamoDB to prevent replay.
 1. A GitHub App JWT is minted from the configured App ID and private key.
 1. The matched target repository installation is resolved.
@@ -54,15 +56,14 @@ audience, subject, expiry,
 not-before, and issued-at claims. The caller's `workflow_ref` must match the selected rule's
 repository, workflow path, and ref. If the job runs in a reusable workflow, its
 `job_workflow_ref` must match too; a trusted caller cannot delegate token minting to a different
-reusable workflow. The event must be listed in the matched rule's `on` list. If a target
-repository or target set is configured, the request body is required and must select only
-repositories authorized by that rule. Singular and plural requests cannot be mixed. Installation
-lookup and token minting use only the requested targets and never an implicit calling repository;
-every target must resolve to the rule's pinned installation ID, and the repositories returned by
-GitHub must exactly match the requested names and IDs. A legacy empty body remains supported for
-same-repository rules.
-Requested repository permissions must be a subset of the matching rule's configured permissions.
-The service rejects unknown, duplicate, or broader permissions.
+reusable workflow. The event must be listed in the matched rule's `on` list. An explicit target
+requires a request body. Singular and plural requests cannot be mixed, and plural requests are
+limited to ten targets. Each target's own policy must approve the caller and the complete requested
+permission map. A shared policy may name several targets, but only its own repository's name and
+GitHub-verified immutable ID confer authority. Every target must resolve to the same installation;
+any installation ID pinned by a rule must also match. The repositories returned by GitHub must
+exactly match the authorized names and IDs. An empty body remains supported for implicit
+same-repository rules. Unknown, duplicate, or broader permissions are rejected.
 
 GitHub applies one permission map to every repository selected for an installation token. A
 cross-repository pull-request publisher therefore needs source-branch write access (typically
@@ -80,10 +81,11 @@ Requests to the following GitHub routes are expected:
 - `GET /repos/{owner}/{repo}/contents/{policy_path}?ref=main`
 - `DELETE /installation/token`
 
-The policy reader requests a token scoped to the pinned policy repository ID with only
-`contents: read`, verifies the returned repository name, ID, and permission map, fetches at most
-256 KiB from the configured path and protected `main` ref, then revokes the read token. A parsed
-policy is cached for up to five minutes with per-worker jitter. Rate limits use bounded exponential
+The policy reader discovers the target's App installation and requests a token scoped to that
+repository name with only `contents: read`. It verifies the returned repository name and permission
+map, records GitHub's immutable repository ID, fetches at most 256 KiB from the configured path and
+protected `main` ref, then revokes the read token. Up to 128 repository policies are cached
+separately for up to five minutes with per-worker jitter. Rate limits use bounded exponential
 backoff and retain a last-known-good snapshot for at most one hour, but exchanges are denied during
 backoff; any other fetch or parse failure clears the cached snapshot and fails closed.
 
@@ -119,12 +121,13 @@ receive notifications. Access logs deliberately omit request headers, OIDC claim
 bodies.
 
 `make deploy-secrets` stores the App ID and private key in AWS. `make deploy` configures the policy
-repository, path, and protected ref, then deploys the SAM stack. The OIDC audience defaults to the
-deployed API URL. Set `POLICY_REPOSITORY`, `POLICY_REPOSITORY_ID`, `POLICY_INSTALLATION_ID`,
-`POLICY_PATH`, `POLICY_REF`, `STACK_NAME`, `APP_ID_PARAMETER`, and `JTI_TABLE_NAME` in `.env`.
+path and protected ref, then deploys the SAM stack. The OIDC audience defaults to the deployed API
+URL. Set `POLICY_PATH`, `POLICY_REF`, `STACK_NAME`, `APP_ID_PARAMETER`, and `JTI_TABLE_NAME` in `.env`.
 Set `POLICY_AUDIENCE` only when using a custom HTTPS endpoint; `ALARM_TOPIC_ARN` is optional as
-well. Protect the policy repository's default branch with a pull-request ruleset that issued tokens
-cannot bypass.
+well. Protect every target repository's default branch with a pull-request ruleset that issued
+tokens cannot bypass. The former `PolicyRepository`, `PolicyRepositoryId`, and
+`PolicyInstallationId` stack parameters are no longer used. Before upgrading an existing stack,
+ensure every target has its own policy and remove those parameters from deployment configuration.
 
 ## Validated domain types
 

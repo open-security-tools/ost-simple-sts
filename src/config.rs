@@ -12,7 +12,7 @@ use crate::{
     error::AppError,
     github::{GithubApiBase, Permissions, RepositoryFullName, RepositoryId},
     jwks::JwksCache,
-    policy_cache::PolicyCache,
+    policy_store::PolicyStore,
 };
 
 const WORKFLOWS_PREFIX: &str = ".github/workflows/";
@@ -180,9 +180,6 @@ pub struct PolicyRef(String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyLocation {
-    repository: RepositoryFullName,
-    repository_id: RepositoryId,
-    installation_id: u64,
     path: PolicyPath,
     git_ref: PolicyRef,
 }
@@ -520,10 +517,6 @@ impl PolicyRule {
 
     pub fn has_target_repository(&self) -> bool {
         self.target.is_some() || self.targets.is_some()
-    }
-
-    pub fn has_multiple_target_repositories(&self) -> bool {
-        self.targets.is_some()
     }
 
     pub fn target_repositories(&self) -> Vec<(RepositoryFullName, RepositoryId)> {
@@ -876,20 +869,6 @@ impl JtiTableName {
 
 impl PolicyLocation {
     pub fn from_env() -> Result<Self, AppError> {
-        let repository = env::var("POLICY_REPOSITORY")
-            .map_err(|_| AppError::PolicyNotConfigured)?
-            .try_into()
-            .map_err(|_| AppError::PolicyNotConfigured)?;
-        let repository_id = env::var("POLICY_REPOSITORY_ID")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .and_then(RepositoryId::new)
-            .ok_or(AppError::PolicyNotConfigured)?;
-        let installation_id = env::var("POLICY_INSTALLATION_ID")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value != 0)
-            .ok_or(AppError::PolicyNotConfigured)?;
         let path = env::var("POLICY_PATH")
             .map_err(|_| AppError::PolicyNotConfigured)?
             .try_into()?;
@@ -897,25 +876,7 @@ impl PolicyLocation {
             .map_err(|_| AppError::PolicyNotConfigured)?
             .try_into()?;
 
-        Ok(Self {
-            repository,
-            repository_id,
-            installation_id,
-            path,
-            git_ref,
-        })
-    }
-
-    pub fn repository(&self) -> &RepositoryFullName {
-        &self.repository
-    }
-
-    pub fn repository_id(&self) -> RepositoryId {
-        self.repository_id
-    }
-
-    pub fn installation_id(&self) -> u64 {
-        self.installation_id
+        Ok(Self { path, git_ref })
     }
 
     pub fn path(&self) -> &str {
@@ -929,9 +890,6 @@ impl PolicyLocation {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            repository: "octo/tools".try_into().unwrap(),
-            repository_id: RepositoryId::new(42).unwrap(),
-            installation_id: 456,
             path: ".github/ost-simple-sts.json".try_into().unwrap(),
             git_ref: "main".try_into().unwrap(),
         }
@@ -963,7 +921,7 @@ impl TryFrom<&str> for AppPrivateKey {
 pub struct Config {
     pub policy_location: PolicyLocation,
     pub policy_audience: Audience,
-    pub policy_cache: Arc<PolicyCache>,
+    pub policy_cache: Arc<PolicyStore>,
     pub app_id: AppId,
     pub app_private_key: AppPrivateKey,
     pub jti_table_name: JtiTableName,
@@ -1015,7 +973,7 @@ impl Config {
         Ok(Self {
             policy_location,
             policy_audience,
-            policy_cache: Arc::new(PolicyCache::default()),
+            policy_cache: Arc::new(PolicyStore::default()),
             app_id,
             app_private_key,
             jti_table_name,
@@ -1707,7 +1665,7 @@ mod tests {
 
         let rule = &policy.rules()[0];
         assert!(rule.has_target_repository());
-        assert!(rule.has_multiple_target_repositories());
+        assert_eq!(rule.target_repositories().len(), 2);
         assert_eq!(rule.target_installation_id(), Some(146796415));
         assert_eq!(
             rule.target_repositories()
