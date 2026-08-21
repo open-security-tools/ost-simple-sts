@@ -6,8 +6,8 @@ secret with a wide blast radius.
 
 `ost-simple-sts` lets an approved GitHub Actions workflow obtain a short-lived GitHub App token
 without storing the App's private key in the repository. Only the configured repository, workflow,
-branch or tag, event, and environment can request a token. A rule can optionally issue access to a
-different, explicitly configured target repository.
+branch or tag, event, and environment can request a token. Each target repository owns the policy
+that grants access to it, including access by workflows in other repositories.
 
 ## GitHub Actions workflow
 
@@ -59,16 +59,15 @@ For the examples below, the GitHub App needs the following repository permission
 - **Contents**: read and write
 - **Metadata**: read-only
 
-Install the App on the repository that owns the policy and each target repository allowed by the
-policy; it does not need to be installed on a separate calling repository. The policy reader
-requests only `contents: read` for the pinned policy repository. Exchanges request only the
-permissions selected by the caller and allowed by the matched policy rule.
+Install the App on every target repository; it does not need to be installed on a separate calling
+repository. The policy reader requests only `contents: read` for one target at a time. Exchanges
+request only the permissions selected by the caller and approved by every target.
 
 ## Policy
 
 The checked-in [`policy-example.json`](./policy-example.json) is an example only. Copy it to
-`.github/ost-simple-sts.json` in the trusted policy repository and replace every example value for
-the calling repository:
+`.github/ost-simple-sts.json` in each target repository and replace every example value for
+the calling and target repositories:
 
 ```json
 {
@@ -101,6 +100,7 @@ The exchange succeeds only when all of these checks pass:
 1. The OIDC subject, including the environment when one is configured
 1. An event allowed by the matched rule
 1. The reusable workflow, if one is used
+1. Each target's own policy authorizes its GitHub-verified repository name and immutable ID
 
 `version: 2`, a non-empty `repositories` map, and a non-empty `rules` list are required. Each
 repository alias pins its name and immutable ID and declares the OIDC subject format. Use
@@ -116,14 +116,18 @@ must match as well. `on` can contain only `issue_comment`, `issues`, `push`, `pu
 `schedule`, and `workflow_dispatch`; empty or duplicate event lists are rejected. Requests can
 select a subset or lower permission level, but never an additional or broader permission.
 
-`target` names one repository alias. A multi-repository rule instead sets `targets` to a list of at
-least two authorized aliases and `installation` to an alias in the top-level `installations` map.
-A request can select one authorized target with `repository` or a subset of at least two with
-`repositories`; the issued token is scoped only to the requested repositories. Singular and plural
-targets are mutually exclusive, and an explicit target always requires an explicit matching
-exchange request, even when it is the caller repository. Unknown fields and aliases, duplicate
-repository names or IDs, duplicate permissions, and overlapping identity rules are rejected so a
-later target or permission grant cannot be silently shadowed.
+`target` names one repository alias. A shared rule can instead set `targets` to a list of at
+least two aliases and `installation` to an alias in the top-level `installations` map. The same
+policy file may be copied between repositories, but each copy can grant access only to its own
+repository. Names and immutable IDs in another repository's policy do not grant authority.
+
+A request selects one target with `repository` or between two and ten with `repositories`.
+Every target must independently authorize the caller and the complete requested permission map;
+all targets must belong to the same App installation. Each target can use its own single-target
+rule or a shared multi-target rule. Singular and plural targets are mutually exclusive, and an
+explicit target requires an explicit matching exchange request, even when it is the caller
+repository. Unknown fields and aliases, duplicate repository names or IDs, duplicate permissions,
+and overlapping identity rules are rejected so a later grant cannot be silently shadowed.
 
 For `pull_request` runs, set `caller_ref` to `refs/pull/*/merge` to match only canonical
 pull-request merge refs. This pattern is valid only with `on: ["pull_request"]`.
@@ -143,17 +147,17 @@ The broker continues to accept `version: 1` policies during migration. Those pol
 explicit `subject`, repository name/ID pairs, workflow paths, `allowed_events`, and target fields;
 the compatibility defaults for events and permissions are unchanged.
 
-The policy is fetched from the configured repository name and immutable ID, the protected `main`
-ref, and the configured path under `.github`. Protect the default branch with a pull-request
-ruleset that cannot be bypassed by an issued token. A successfully parsed policy is cached for up
-to five minutes; invalid, unavailable, or rate-limited refreshes fail closed and cannot authorize
-an exchange.
+Each policy is fetched from the requested target repository, the protected `main` ref, and the
+configured path under `.github`. GitHub supplies the repository's immutable ID and App installation;
+a policy cannot choose either identity. Protect every target's default branch with a pull-request
+ruleset that issued tokens cannot bypass. Policies are cached separately for up to five minutes;
+invalid, unavailable, or rate-limited refreshes fail closed and cannot authorize an exchange.
 
 ## Deploy
 
-Create the local configuration, set the policy repository identity, and set the App ID and
-private-key location in `.env`. The OIDC audience defaults to the deployed API URL; set
-`POLICY_AUDIENCE` only when using a custom HTTPS endpoint. Commit the policy to the trusted
+Create the local configuration and set the App ID and private-key location in `.env`. The OIDC
+audience defaults to the deployed API URL; set
+`POLICY_AUDIENCE` only when using a custom HTTPS endpoint. Commit the policy to each target
 repository before deploying:
 
 ```bash
@@ -165,7 +169,7 @@ make deploy
 ```
 
 The stack provisions the exchange API, Lambda, replay protection, logging, and alarms. The App ID
-and private key are stored in AWS; the policy rules remain in the trusted repository. Deployment
+and private key are stored in AWS; the policy rules remain in their target repositories. Deployment
 settings can be overridden in `.env`;
 `ENV_FILE=/path/to/.env make deploy` selects another environment file.
 
@@ -174,8 +178,7 @@ settings can be overridden in `.env`;
 The exchange lifecycle is roughly:
 
 1. Receive a GitHub Actions OIDC token
-1. Validate the token, fetch the trusted policy when the cache expires, and match one configured
-   policy rule
+1. Validate the token, fetch each target's policy when its cache expires, and match a rule in each
 1. Reject tokens that have already been exchanged
 1. Mint and return a repository-scoped GitHub App token
 

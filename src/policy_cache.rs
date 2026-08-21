@@ -10,20 +10,20 @@ const STALE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_JITTER: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60);
 
-pub struct PolicyCache {
-    state: Mutex<CacheState>,
+pub struct PolicyCache<T = Policy> {
+    state: Mutex<CacheState<T>>,
     primary_ttl: Duration,
     stale_ttl: Duration,
     jitter: Duration,
 }
 
-pub struct LoadedPolicy {
-    policy: Policy,
+pub struct LoadedPolicy<T = Policy> {
+    policy: T,
     retry_after: Option<Duration>,
 }
 
-impl LoadedPolicy {
-    pub fn policy(&self) -> &Policy {
+impl<T> LoadedPolicy<T> {
+    pub fn policy(&self) -> &T {
         &self.policy
     }
 
@@ -32,19 +32,28 @@ impl LoadedPolicy {
     }
 }
 
-#[derive(Default)]
-struct CacheState {
-    policy: Option<CachedPolicy>,
+struct CacheState<T> {
+    policy: Option<CachedPolicy<T>>,
     retry_at: Option<Instant>,
     consecutive_rate_limits: u32,
 }
 
-struct CachedPolicy {
-    policy: Policy,
+impl<T> Default for CacheState<T> {
+    fn default() -> Self {
+        Self {
+            policy: None,
+            retry_at: None,
+            consecutive_rate_limits: 0,
+        }
+    }
+}
+
+struct CachedPolicy<T> {
+    policy: T,
     loaded_at: Instant,
 }
 
-impl Default for PolicyCache {
+impl<T: Clone> Default for PolicyCache<T> {
     fn default() -> Self {
         let entropy = Uuid::new_v4();
         let mut bytes = [0; 8];
@@ -54,7 +63,7 @@ impl Default for PolicyCache {
     }
 }
 
-impl PolicyCache {
+impl<T: Clone> PolicyCache<T> {
     fn with_jitter(primary_ttl: Duration, stale_ttl: Duration, jitter: Duration) -> Self {
         Self {
             state: Mutex::new(CacheState::default()),
@@ -64,7 +73,7 @@ impl PolicyCache {
         }
     }
 
-    fn set_backoff(&self, state: &mut CacheState, retry_after: Duration) -> Duration {
+    fn set_backoff(&self, state: &mut CacheState<T>, retry_after: Duration) -> Duration {
         state.consecutive_rate_limits = state.consecutive_rate_limits.saturating_add(1);
         let multiplier = 1u32
             .checked_shl(state.consecutive_rate_limits.saturating_sub(1))
@@ -78,10 +87,10 @@ impl PolicyCache {
         retry_after
     }
 
-    pub async fn get_or_load<F, Fut>(&self, loader: F) -> Result<LoadedPolicy, AppError>
+    pub async fn get_or_load<F, Fut>(&self, loader: F) -> Result<LoadedPolicy<T>, AppError>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<Policy, AppError>>,
+        Fut: Future<Output = Result<T, AppError>>,
     {
         let mut state = self.state.lock().await;
         if let Some(retry_at) = state.retry_at {
@@ -145,7 +154,7 @@ impl PolicyCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_policy(policy: Policy) -> Self {
+    pub(crate) fn with_policy(policy: T) -> Self {
         Self {
             state: Mutex::new(CacheState {
                 policy: Some(CachedPolicy {

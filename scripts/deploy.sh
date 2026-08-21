@@ -8,9 +8,6 @@
 #
 # Required .env variables:
 #   STACK_NAME                  CloudFormation stack name
-#   POLICY_REPOSITORY           Repository that owns the trusted broker policy
-#   POLICY_REPOSITORY_ID        Immutable ID of the policy repository
-#   POLICY_INSTALLATION_ID      GitHub App installation that can read the policy
 #   POLICY_PATH                 JSON policy path under .github
 #   POLICY_REF                  Protected policy ref (main)
 #   APP_ID_PARAMETER            SSM parameter name for App ID
@@ -53,9 +50,6 @@ source "$ENV_FILE"
 set +a
 
 require_var STACK_NAME
-require_var POLICY_REPOSITORY
-require_var POLICY_REPOSITORY_ID
-require_var POLICY_INSTALLATION_ID
 require_var POLICY_PATH
 require_var POLICY_REF
 require_var APP_ID_PARAMETER
@@ -76,9 +70,6 @@ sam deploy \
   --stack-name "$STACK_NAME" \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
-    "ParameterKey=PolicyRepository,ParameterValue=$POLICY_REPOSITORY" \
-    "ParameterKey=PolicyRepositoryId,ParameterValue=$POLICY_REPOSITORY_ID" \
-    "ParameterKey=PolicyInstallationId,ParameterValue=$POLICY_INSTALLATION_ID" \
     "ParameterKey=PolicyPath,ParameterValue=$POLICY_PATH" \
     "ParameterKey=PolicyRef,ParameterValue=$POLICY_REF" \
     "ParameterKey=PolicyAudience,ParameterValue=${POLICY_AUDIENCE:-}" \

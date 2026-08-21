@@ -28,20 +28,6 @@ Globals:
     MemorySize: 256
 
 Parameters:
-  PolicyRepository:
-    Type: String
-    MinLength: 3
-    MaxLength: 201
-    AllowedPattern: '(?!.*[.][.])(?!.*[.](/|$))[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}'
-    Description: Repository that owns the trusted broker policy
-  PolicyRepositoryId:
-    Type: Number
-    MinValue: 1
-    Description: Immutable ID of the policy repository
-  PolicyInstallationId:
-    Type: Number
-    MinValue: 1
-    Description: GitHub App installation that can read the policy repository
   PolicyPath:
     Type: String
     Default: .github/ost-simple-sts.json
@@ -147,9 +133,6 @@ Resources:
         LogGroup: !Ref FunctionLogGroup
       Environment:
         Variables:
-          POLICY_REPOSITORY: !Ref PolicyRepository
-          POLICY_REPOSITORY_ID: !Ref PolicyRepositoryId
-          POLICY_INSTALLATION_ID: !Ref PolicyInstallationId
           POLICY_PATH: !Ref PolicyPath
           POLICY_REF: !Ref PolicyRef
           POLICY_AUDIENCE: !If

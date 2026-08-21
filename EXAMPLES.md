@@ -30,7 +30,7 @@ the repository owner's ID:
 
 A workflow in one repository can update a different repository without granting the caller access.
 This rule lets a fork-sync workflow in `octo-org/widgets` receive a token scoped only to
-`octo-org/widgets-dev`:
+`octo-org/widgets-dev`. Store it in `octo-org/widgets-dev`'s policy file:
 
 ```json
 {
@@ -61,7 +61,8 @@ requires an explicit matching request; it cannot be exchanged using the legacy e
 A workflow can request one installation token scoped to authorized repositories when the source
 branch and destination pull request live in different repositories. Both repositories must belong
 to the same App installation. `permissions` is one permission ceiling applied to every repository
-in `targets`; it cannot grant different permissions per target:
+in `targets`; it cannot grant different permissions per target. Store this rule in both target
+repositories (or give each repository its own equivalent single-target rule):
 
 ```json
 {
@@ -89,8 +90,8 @@ permissions: |
 The `repositories` action output contains the requested repositories, one per line. A workflow
 that needs only one authorized target can use `repository: octo-org/widgets` instead, and its
 installation token is scoped only to that repository. Singular `repository` and plural
-`repositories` inputs are mutually exclusive; unknown repositories and combinations of targets
-from different rules are denied.
+`repositories` inputs are mutually exclusive. A missing or denying policy in either target
+rejects the entire exchange; one repository's policy cannot approve the other repository.
 
 GitHub applies one permission map to every repository in an installation token. Creating a
 cross-repository pull request requires write access to the source branch, so `pull_requests: write`
